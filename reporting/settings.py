@@ -1,0 +1,85 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+from zoneinfo import ZoneInfo
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default).lower()).lower() in {"1", "true", "yes", "on"}
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _path_env(name: str, default: str | None = None) -> Optional[Path]:
+    value = os.getenv(name, default)
+    if not value:
+        return None
+    return Path(value).expanduser().resolve()
+
+
+@dataclass(slots=True)
+class Settings:
+    grafana_url: str = field(default_factory=lambda: os.getenv("GRAFANA_URL", "https://grafana.example.com").rstrip("/"))
+    grafana_user: str = field(default_factory=lambda: os.getenv("GRAFANA_USER", "report-user"))
+    grafana_password: str = field(default_factory=lambda: os.getenv("GRAFANA_PASSWORD", ""))
+    grafana_org_id: str = field(default_factory=lambda: os.getenv("GRAFANA_ORG_ID", "1"))
+
+    email_backend: str = field(default_factory=lambda: os.getenv("EMAIL_BACKEND", "smtp").lower())
+    email_template_mode: str = field(default_factory=lambda: os.getenv("EMAIL_TEMPLATE_MODE", "plain").lower())
+    email_template_html_path: Optional[Path] = field(default_factory=lambda: _path_env("EMAIL_TEMPLATE_HTML_PATH"))
+    email_template_images_dir: Optional[Path] = field(default_factory=lambda: _path_env("EMAIL_TEMPLATE_IMAGES_DIR"))
+    smtp_host: str = field(default_factory=lambda: os.getenv("SMTP_HOST", "localhost"))
+    smtp_port: int = field(default_factory=lambda: _int_env("SMTP_PORT", 25))
+    smtp_user: str = field(default_factory=lambda: os.getenv("SMTP_USER", ""))
+    smtp_pass: str = field(default_factory=lambda: os.getenv("SMTP_PASS", ""))
+    sendgrid_api_key: str = field(default_factory=lambda: os.getenv("SENDGRID_API_KEY", ""))
+    sendgrid_from: str = field(default_factory=lambda: os.getenv("SENDGRID_FROM", ""))
+    sendgrid_reply_to: str = field(default_factory=lambda: os.getenv("SENDGRID_REPLY_TO", ""))
+    email_from: str = field(default_factory=lambda: os.getenv("EMAIL_FROM", "Grafana Reports <reports@example.com>"))
+    email_enabled: bool = field(default_factory=lambda: _bool_env("REPORTS_EMAIL_ENABLED", True))
+
+    default_tz: str = field(default_factory=lambda: os.getenv("DEFAULT_TZ", "Europe/Prague"))
+    pdf_outdir: Path = field(default_factory=lambda: Path(os.getenv("PDF_OUTDIR", "./")).resolve())
+    viewport_width: int = field(default_factory=lambda: _int_env("VIEWPORT_WIDTH", 1920))
+    viewport_height: int = field(default_factory=lambda: _int_env("VIEWPORT_HEIGHT", 1080))
+    wait_extra_ms: int = field(default_factory=lambda: _int_env("WAIT_EXTRA_MS", 20000))
+    pdf_landscape: bool = field(default_factory=lambda: _bool_env("PDF_LANDSCAPE", True))
+    pdf_paper_format: str = field(default_factory=lambda: os.getenv("PDF_PAPER_FORMAT", "A4"))
+    pdf_size_mode: str = field(default_factory=lambda: os.getenv("PDF_SIZE_MODE", "auto").lower())
+    pdf_max_inch: float = field(default_factory=lambda: _float_env("PDF_MAX_INCH", 200.0))
+    pdf_css_px_per_in: float = field(default_factory=lambda: _float_env("PDF_CSS_PX_PER_IN", 96.0))
+
+    pdf_fast_mode: bool = field(default_factory=lambda: _bool_env("PDF_FAST_MODE", True))
+    ready_timeout_ms: int = field(default_factory=lambda: _int_env("READY_TIMEOUT_MS", 180000))
+
+    render_locale: str = field(default_factory=lambda: os.getenv("RENDER_LOCALE", "en-US"))
+    render_timezone: str = field(default_factory=lambda: os.getenv("RENDER_TIMEZONE", "Europe/Prague"))
+    debug_render: bool = field(default_factory=lambda: _bool_env("DEBUG_RENDER", True))
+    debug_screenshot: bool = field(default_factory=lambda: _bool_env("DEBUG_SCREENSHOT", False))
+    kiosk_mode: str = field(default_factory=lambda: os.getenv("KIOSK_MODE", "1"))
+    force_kiosk_css: bool = field(default_factory=lambda: _bool_env("FORCE_KIOSK_CSS", True))
+    run_all_concurrency: int = field(default_factory=lambda: _int_env("RUN_ALL_CONCURRENCY", 2))
+
+    config_path: Path = field(default_factory=lambda: Path(os.getenv("REPORTS_CONFIG_PATH", "config.yml")))
+
+    def zoneinfo(self, name: str | None = None) -> ZoneInfo:
+        return ZoneInfo(name or self.default_tz)
+
+
+settings = Settings()
+settings.pdf_outdir.mkdir(parents=True, exist_ok=True)
