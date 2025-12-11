@@ -451,6 +451,30 @@ class GrafanaPDFRenderer:
 
     async def _inject_styles(self, page) -> None:
         await page.add_style_tag(content=self._style_block())
+        # Remove any visible "PDF Export" buttons/links to keep the PDF clean
+        try:
+            await page.evaluate(
+                    """
+                    (() => {
+                        const isPdfExportLabel = (el) => {
+                            const txt = (el.textContent || '').toLowerCase();
+                            return txt.includes('pdf export');
+                        };
+                        const selectors = [
+                            'a[href*="/pdf-export"]',
+                            'button[href*="/pdf-export"]',
+                        ];
+                        selectors.forEach(sel => {
+                            document.querySelectorAll(sel).forEach(el => el.remove());
+                        });
+                        document.querySelectorAll('a, button').forEach(el => {
+                            if (isPdfExportLabel(el)) el.remove();
+                        });
+                    })();
+                    """
+            )
+        except Exception:
+                pass
 
     async def _inject_banner(self, page, title: str, period: str, generated: str) -> None:
         try:
@@ -526,7 +550,8 @@ class GrafanaPDFRenderer:
             [data-testid="TimeRangePicker"], [data-testid="DashboardHeader"],
             [data-testid="page-header"], [data-testid="breadcrumbs"], [aria-label="Breadcrumbs"],
             [data-testid="page-actions"], [data-testid="DataLinksButton"],
-            [data-testid="RefreshPicker"], [aria-label="Refresh dashboard"] {
+            [data-testid="RefreshPicker"], [aria-label="Refresh dashboard"],
+            .css-12rf1df {
               display: none !important;
             }
 
@@ -537,6 +562,25 @@ class GrafanaPDFRenderer:
             .panel-menu-container {
               display: none !important;
             }
+
+                        /* Keep panel legends visible (Grafana legends use buttons) */
+                        [data-testid="viz-legend"], [data-testid="legend"], .viz-legend, .legend-container, .graph-legend, .panel-legend {
+                            display: flex !important;
+                            visibility: visible !important;
+                            opacity: 1 !important;
+                            height: auto !important;
+                        }
+                        [data-testid="viz-legend"] button,
+                        [data-testid="legend"] button,
+                        .legend-container button,
+                        .panel-legend button,
+                        .graph-legend button,
+                        [data-testid="legend-item"] button,
+                        [data-testid="viz-legend-item"] button {
+                            display: inline-flex !important;
+                            visibility: visible !important;
+                            opacity: 1 !important;
+                        }
 
             .page, .page-content, .main-view, .dashboard-container {
               padding: 0 !important; margin: 0 !important;
@@ -654,13 +698,20 @@ class GrafanaPDFRenderer:
                 break-inside: avoid !important;
               }
 
-              button:not([role="columnheader"] button):not([role="columnheader"] *),
-              [role="button"]:not([role="columnheader"] [role="button"]):not([role="columnheader"] *) {
-                display: none !important;
-              }
-              .toolbar, .gf-form {
-                display: none !important;
-              }
+                            /* Hide general UI controls but keep legends */
+                            .toolbar button,
+                            nav button,
+                            [data-testid="topnav"] button,
+                            [data-testid="page-actions"] button,
+                            [data-testid="page-header"] button,
+                            [data-testid="DashboardHeader"] button,
+                            [data-testid="RefreshPicker"] button,
+                            .gf-form button {
+                                display: none !important;
+                            }
+                            .toolbar, .gf-form {
+                                display: none !important;
+                            }
 
               table thead,
               thead,
