@@ -63,9 +63,17 @@ class Settings:
     pdf_size_mode: str = field(default_factory=lambda: os.getenv("PDF_SIZE_MODE", "auto").lower())
     pdf_max_inch: float = field(default_factory=lambda: _float_env("PDF_MAX_INCH", 200.0))
     pdf_css_px_per_in: float = field(default_factory=lambda: _float_env("PDF_CSS_PX_PER_IN", 96.0))
+    pdf_media: str = field(default_factory=lambda: os.getenv("PDF_MEDIA", "print").lower())
 
     pdf_fast_mode: bool = field(default_factory=lambda: _bool_env("PDF_FAST_MODE", True))
     ready_timeout_ms: int = field(default_factory=lambda: _int_env("READY_TIMEOUT_MS", 180000))
+    network_idle_timeout_ms: int = field(default_factory=lambda: _int_env("NETWORK_IDLE_TIMEOUT_MS", 20000))
+    wait_before_ready_ms: int = field(default_factory=lambda: _int_env("WAIT_BEFORE_READY_MS", 0))
+
+    check_queries_to_complete: bool = field(default_factory=lambda: _bool_env("CHECK_QUERIES_TO_COMPLETE", False))
+    check_queries_completion_timeout_ms: int = field(default_factory=lambda: _int_env("CHECK_QUERIES_TO_COMPLETE_QUERIES_COMPLETION_TIMEOUT", 60000))
+    check_queries_stuck_threshold_ms: int = field(default_factory=lambda: _int_env("CHECK_QUERIES_TO_COMPLETE_MAX_QUERY_COMPLETION_TIME", 30000))
+    check_queries_poll_interval_ms: int = field(default_factory=lambda: _int_env("CHECK_QUERIES_TO_COMPLETE_QUERIES_INTERVAL", 2000))
 
     render_locale: str = field(default_factory=lambda: os.getenv("RENDER_LOCALE", "en-US"))
     render_timezone: str = field(default_factory=lambda: os.getenv("RENDER_TIMEZONE", "Europe/Prague"))

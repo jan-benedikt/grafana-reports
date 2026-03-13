@@ -68,20 +68,28 @@ class GrafanaPDFRenderer:
             print(f"[DEBUG] render_url: Navigating to {url}")
             await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
             print(f"[DEBUG] render_url: Page loaded (domcontentloaded)")
-            if not self.settings.pdf_fast_mode:
+            network_timeout = self.settings.network_idle_timeout_ms if self.settings.pdf_fast_mode else 60_000
+            if network_timeout > 0:
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=60_000)
+                    await page.wait_for_load_state("networkidle", timeout=network_timeout)
+                    print(f"[DEBUG] render_url: Network idle (timeout={network_timeout}ms)")
                 except Exception:
-                    pass
+                    print(f"[DEBUG] render_url: Network idle not reached within {network_timeout}ms, continuing")
+            if self.settings.wait_before_ready_ms > 0:
+                print(f"[DEBUG] render_url: Waiting {self.settings.wait_before_ready_ms}ms before panel checks")
+                await page.wait_for_timeout(self.settings.wait_before_ready_ms)
 
             if await page.locator('input[name="user"], form[action="/login"]').count() > 0:
                 await self._handle_login(page, url)
 
+            await self._wait_for_queries_complete(page, url)
+
             print(f"[DEBUG] render_url: Injecting styles and banner")
             await self._inject_styles(page)
             await self._inject_banner(page, header_title, header_period, header_generated)
-            await page.emulate_media(media="print")
-            print(f"[DEBUG] render_url: Styles and banner injected")
+            media = self.settings.pdf_media if getattr(self.settings, "pdf_media", None) in {"print", "screen"} else "print"
+            await page.emulate_media(media=media)
+            print(f"[DEBUG] render_url: Styles and banner injected (media={media})")
 
             print(f"[DEBUG] render_url: Waiting for panels to be ready")
             ready = await self._wait_for_panels_ready(page)
@@ -232,6 +240,140 @@ class GrafanaPDFRenderer:
         except Exception:
             return default
 
+    async def _get_expected_query_count(self, page) -> int | None:
+        """Get expected number of data queries from dashboard JSON (from browser performance entries)."""
+        script = """
+        (async () => {
+          const excludedTypes = ['text'];
+          const entry = performance.getEntriesByType("resource").find(r => {
+            if (!['fetch','xmlhttprequest'].includes(r.initiatorType)) return false;
+            const u = r.name;
+            return /\\/api\\/dashboards\\/uid\\/[^/?#]+/.test(u) ||
+              /\\/apis\\/dashboard\\.grafana\\.app\\/v1beta1\\/namespaces\\/[^/]+\\/dashboards\\/[^/]+\\/dto(?:\\?|$)/.test(u);
+          });
+          if (!entry) return null;
+          try {
+            const res = await fetch(entry.name, { credentials: 'include' });
+            if (!res.ok) return null;
+            const json = await res.json();
+            const root = json?.spec ?? json?.model ?? json?.dashboard ?? json;
+            const panels = Array.isArray(root?.panels) ? root.panels : [];
+            const templating = root?.templating?.list ?? [];
+            function countPanels(list) {
+              let n = 0;
+              for (const p of list) {
+                if (!p || excludedTypes.includes(p.type)) continue;
+                if (p.type === 'row' && Array.isArray(p.panels)) { n += countPanels(p.panels); continue; }
+                const hasDs = !!p.datasource || (Array.isArray(p.targets) && p.targets.some(t => t?.datasource));
+                if (hasDs) n++;
+              }
+              return n;
+            }
+            const valid = countPanels(panels);
+            const templatingQueries = templating.filter(v => v?.type === 'query').length;
+            return valid + templatingQueries;
+          } catch (e) {
+            return null;
+          }
+        })()
+        """
+        result = await self._safe_eval(page, script, default=None)
+        if result is None:
+            return None
+        return int(result) if isinstance(result, (int, float)) else None
+
+    async def _get_completed_query_count(self, page) -> int:
+        """Count completed Grafana query requests in the page's performance entries."""
+        script = """
+        () => performance.getEntriesByType("resource")
+          .filter(r => r.initiatorType === 'fetch' && r.name.includes('query')).length
+        """
+        val = await self._safe_eval(page, script, default=0)
+        return int(val or 0)
+
+    async def _wait_for_queries_complete(self, page, url: str) -> None:
+        """
+        Wait for Grafana data queries to complete by polling performance entries.
+        Skips when CHECK_QUERIES_TO_COMPLETE is off or URL is single-panel (viewPanel=).
+        """
+        if not self.settings.check_queries_to_complete:
+            return
+        if "viewPanel=" in url:
+            print("[DEBUG] render_url: Skipping query wait (single-panel view)")
+            return
+        print("[DEBUG] render_url: Waiting for all queries to complete (CHECK_QUERIES_TO_COMPLETE)")
+        # Scroll to trigger lazy-loaded panels
+        await self._safe_eval(
+            page,
+            """
+            (async () => {
+              const sel = '.scroll-canvas, [data-testid="scroll-container"], .dashboard-container';
+              const scrollableSection = document.querySelector(sel);
+              if (scrollableSection) {
+                const totalHeight = scrollableSection.scrollHeight;
+                const viewportHeight = window.innerHeight;
+                let scrolled = 0;
+                while (scrolled < totalHeight) {
+                  scrollableSection.scrollBy(0, viewportHeight);
+                  scrolled += viewportHeight;
+                  await new Promise(r => setTimeout(r, 500));
+                }
+              }
+            })()
+            """,
+        )
+        await page.wait_for_timeout(500)
+        expected = await self._get_expected_query_count(page)
+        if expected is None or expected == 0:
+            print("[DEBUG] render_url: Could not get expected query count, skipping query wait")
+            return
+        # Optional: subtract panels with errors so we don't wait forever for failed panels
+        panel_error_count = await self._safe_eval(
+            page,
+            """
+            () => {
+              const sel = '[data-testid="panel-error-container"], .panel-content .alert-error, .react-panel-error';
+              const els = document.querySelectorAll(sel);
+              const panels = new Set();
+              els.forEach(el => {
+                const p = el.closest('[data-testid="panel-container"], .react-grid-item, .panel-container');
+                if (p) panels.add(p);
+              });
+              return panels.size;
+            }
+            """,
+            default=0,
+        )
+        panel_error_count = int(panel_error_count or 0)
+        effective_expected = max(0, expected - panel_error_count)
+        if effective_expected == 0:
+            print("[DEBUG] render_url: No effective queries to wait for")
+            return
+        timeout_ms = self.settings.check_queries_completion_timeout_ms
+        stuck_ms = self.settings.check_queries_stuck_threshold_ms
+        interval_ms = self.settings.check_queries_poll_interval_ms
+        elapsed = 0
+        last_count = -1
+        stuck_since = 0
+        while elapsed < timeout_ms and not page.is_closed():
+            completed = await self._get_completed_query_count(page)
+            if completed >= effective_expected:
+                print(f"[DEBUG] render_url: All queries complete ({completed}/{effective_expected})")
+                return
+            if completed == last_count:
+                stuck_since += interval_ms
+                if stuck_since >= stuck_ms:
+                    print(f"[WARN] Query count unchanged at {completed}/{effective_expected} for {stuck_ms}ms, proceeding")
+                    return
+            else:
+                stuck_since = 0
+            last_count = completed
+            await page.wait_for_timeout(interval_ms)
+            elapsed += interval_ms
+            if elapsed % 10000 < interval_ms:
+                print(f"[DEBUG] render_url: Queries {completed}/{effective_expected}, elapsed {elapsed}ms")
+        print(f"[WARN] Query wait timed out after {timeout_ms}ms (last: {last_count}/{effective_expected}), proceeding")
+
     async def _compute_pdf_dimensions(self, page) -> tuple[float, float]:
         vals = await self._safe_eval(
             page,
@@ -370,10 +512,10 @@ class GrafanaPDFRenderer:
             return True
 
         if self.settings.pdf_fast_mode and exp <= 8:
-            for _ in range(15):
-                if await no_spinners():
+            for _ in range(75):  # up to ~15s (75 * 200ms) so slow panels can render
+                if await no_spinners() and await tables_non_empty():
                     rd = await ready_panels()
-                    if rd >= max(1, int(exp * 0.5)):
+                    if rd >= max(1, int(exp * 0.6)):
                         return True
                 await page.wait_for_timeout(200)
         else:
@@ -392,7 +534,7 @@ class GrafanaPDFRenderer:
                 consecutive_ready = 0
                 last_ready_count = ready
 
-            if await no_spinners():
+            if await no_spinners() and await tables_non_empty():
                 if ready >= max(1, int((exp or 1) * 0.6)):
                     return True
                 if consecutive_ready >= 3 and ready >= 1:
@@ -590,6 +732,16 @@ class GrafanaPDFRenderer:
             html, body {
               background: #ffffff !important;
               overflow: visible !important;
+              -webkit-print-color-adjust: exact !important;
+              print-color-adjust: exact !important;
+            }
+            /* Preserve Grafana threshold/conditional formatting colors in table cells (avoid green turning pink in PDF) */
+            table td, table th, .table-panel td, .table-panel th,
+            [data-testid="table"] td, [data-testid="table"] th,
+            [role="cell"], [role="gridcell"],
+            [data-testid="table"] [role="row"] > div {
+              -webkit-print-color-adjust: exact !important;
+              print-color-adjust: exact !important;
             }
 
             body, html {
@@ -686,6 +838,17 @@ class GrafanaPDFRenderer:
               @page {
                 margin: 0;
                 size: auto;
+              }
+              html, body {
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+              }
+              table td, table th, .table-panel td, .table-panel th,
+              [data-testid="table"] td, [data-testid="table"] th,
+              [role="cell"], [role="gridcell"],
+              [data-testid="table"] [role="row"] > div {
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
               }
               body {
                 padding: 0 !important;

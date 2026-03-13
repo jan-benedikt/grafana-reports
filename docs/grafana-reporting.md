@@ -42,6 +42,7 @@ reports:
 ```
 Key notes:
 - `cron` uses standard crontab syntax in the target timezone.
+- `from` / `to` support Grafana-style relative time: `now`, `now-30d`, `now-1M`, `now/M`, `now-1M/M`, plus epoch ms and ISO dates. Use a trailing minus for “end of period”, e.g. **`now/M-1d`** = one day before start of current month = **last day of previous month**. Example for “full previous month” (1st to 28th/29th): `from: "now-1M/M"`, `to: "now/M-1d"`. Expressions with a round suffix or minus are converted to explicit epoch timestamps in the URL so Grafana shows the correct range.
 - `vars` become `var-*` query params for Grafana.
 - `body_html` is optional; falls back to plaintext.
 
@@ -93,13 +94,21 @@ Per-report `email.body_html` overrides the shared template. Context provides `na
 | `PDF_SIZE_MODE` | `auto`, `a4`, or `css` for page sizing. |
 | `PDF_LANDSCAPE`, `PDF_PAPER_FORMAT` | Traditional print options. |
 | `WAIT_EXTRA_MS`, `READY_TIMEOUT_MS` | Control how long the renderer waits for panels. |
-| `PDF_FAST_MODE` | Skips heavy scrolling and relies on spinner detection for small dashboards. |
+| `NETWORK_IDLE_TIMEOUT_MS` | Time (ms) to wait for network idle after load (default 20000). In fast mode this is used; for slow dashboards set to 45000–60000. |
+| `WAIT_BEFORE_READY_MS` | Optional delay (ms) before panel-ready checks (default 0). Use 5000–10000 if data backends are slow to respond. |
+| `CHECK_QUERIES_TO_COMPLETE` | When `true`, wait for Grafana data queries to complete (by counting completed `/query` requests) before rendering. Useful for dashboards with long-running queries. |
+| `CHECK_QUERIES_TO_COMPLETE_QUERIES_COMPLETION_TIMEOUT` | Max time (ms) to wait for all queries (default 60000). |
+| `CHECK_QUERIES_TO_COMPLETE_MAX_QUERY_COMPLETION_TIME` | If the completed-query count is unchanged for this many ms, stop waiting (default 30000). |
+| `CHECK_QUERIES_TO_COMPLETE_QUERIES_INTERVAL` | Polling interval (ms) for query completion (default 2000). |
+| `PDF_FAST_MODE` | Skips heavy scrolling and relies on spinner detection for small dashboards. Set to `0` for very slow dashboards. |
+| `PDF_MEDIA` | Which CSS media to emulate for PDF: `print` (default) or `screen`. If some colors differ from Grafana (e.g. green table cells turning pink), try `PDF_MEDIA=screen`. |
 | `PDF_OUTDIR` | Directory where PDFs are written before emailing. |
 
 ## 9. Troubleshooting
 - **Table headers missing**: ensure kiosk CSS is enabled (`FORCE_KIOSK_CSS=1`) and that the Grafana theme hasn't overridden table components.
 - **Blank last page**: keep `PDF_SIZE_MODE=auto` so the renderer clamps to actual DOM height; the code also enforces `page_ranges="1"`.
 - **Playwright login loops**: verify `GRAFANA_USER`/`GRAFANA_PASSWORD` are correct and that the Grafana user has proper dashboard access permissions.
+- **Charts or tables empty in PDF**: the renderer waits for network idle and for tables to have data. For dashboards with slow or many queries, set `CHECK_QUERIES_TO_COMPLETE=true` so the renderer waits for Grafana’s data queries to finish (based on completed `/query` requests) before taking the PDF. You can also increase `NETWORK_IDLE_TIMEOUT_MS`, set `WAIT_BEFORE_READY_MS`, or set `PDF_FAST_MODE=0` and raise `READY_TIMEOUT_MS`.
 - **Email template issues**: confirm paths exist and HTML references `cid` that match filenames inside `EMAIL_TEMPLATE_IMAGES_DIR`.
 
 Refer to `grafana_report.py` comments and the modules under `reporting/` for deeper details.
