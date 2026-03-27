@@ -63,7 +63,7 @@ class Settings:
     pdf_size_mode: str = field(default_factory=lambda: os.getenv("PDF_SIZE_MODE", "auto").lower())
     pdf_max_inch: float = field(default_factory=lambda: _float_env("PDF_MAX_INCH", 200.0))
     pdf_css_px_per_in: float = field(default_factory=lambda: _float_env("PDF_CSS_PX_PER_IN", 96.0))
-    pdf_media: str = field(default_factory=lambda: os.getenv("PDF_MEDIA", "print").lower())
+    pdf_media: str = field(default_factory=lambda: os.getenv("PDF_MEDIA", "screen").lower())
 
     pdf_fast_mode: bool = field(default_factory=lambda: _bool_env("PDF_FAST_MODE", True))
     ready_timeout_ms: int = field(default_factory=lambda: _int_env("READY_TIMEOUT_MS", 180000))

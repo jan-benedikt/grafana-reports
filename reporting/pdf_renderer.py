@@ -87,9 +87,8 @@ class GrafanaPDFRenderer:
             print(f"[DEBUG] render_url: Injecting styles and banner")
             await self._inject_styles(page)
             await self._inject_banner(page, header_title, header_period, header_generated)
-            media = self.settings.pdf_media if getattr(self.settings, "pdf_media", None) in {"print", "screen"} else "print"
-            await page.emulate_media(media=media)
-            print(f"[DEBUG] render_url: Styles and banner injected (media={media})")
+            await page.emulate_media(media="print")
+            print(f"[DEBUG] render_url: Styles and banner injected")
 
             print(f"[DEBUG] render_url: Waiting for panels to be ready")
             ready = await self._wait_for_panels_ready(page)
