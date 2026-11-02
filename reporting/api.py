@@ -8,6 +8,7 @@ from fastapi.responses import FileResponse
 from zoneinfo import ZoneInfo
 
 from .email_service import EmailService
+from .job_queue import JobQueue
 from .models import ReportConfig, load_reports_config
 from .pdf_renderer import GrafanaPDFRenderer
 from .report_service import ReportRunner
@@ -27,6 +28,14 @@ _report_by_uid = {r.dashboard_uid: r for r in _reports}
 _renderer = GrafanaPDFRenderer(settings)
 _mailer = EmailService(settings)
 _runner = ReportRunner(settings, _renderer, _mailer)
+
+_job_queue: JobQueue | None = None
+
+
+def set_job_queue(queue: JobQueue) -> None:
+    """Called by the daemon to share the queue with API handlers."""
+    global _job_queue
+    _job_queue = queue
 
 
 def _cleanup_file(path):
@@ -157,6 +166,20 @@ async def pdf_export(
             ),
         )
 
-    pdf_path = await _runner.generate_pdf(report, tz, time_from=from_, time_to=to, send_mail=False)
+    if _job_queue is not None:
+        pdf_path = await _job_queue.submit(
+            f"API: {report.name}",
+            lambda r=report, t=tz, f=from_, tt=to: _runner.generate_pdf(r, t, time_from=f, time_to=tt, send_mail=False),
+        )
+    else:
+        pdf_path = await _runner.generate_pdf(report, tz, time_from=from_, time_to=to, send_mail=False)
+
     background_tasks.add_task(_cleanup_file, pdf_path)
     return FileResponse(pdf_path, media_type="application/pdf", filename=pdf_path.name)
+
+
+@app.get("/queue", tags=["health"])
+async def queue_status():
+    if _job_queue is None:
+        return {"status": "no queue (standalone API mode)", "concurrency": 1}
+    return _job_queue.status()

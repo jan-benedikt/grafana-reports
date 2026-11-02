@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from reporting import settings
 from reporting.email_service import EmailService
+from reporting.job_queue import JobQueue
 from reporting.models import ReportConfig, load_reports_config
 from reporting.pdf_renderer import GrafanaPDFRenderer
 from reporting.report_service import ReportRunner, run_all_reports
@@ -35,14 +36,21 @@ async def _run_single_report(runner: ReportRunner, report: ReportConfig, tz: Zon
     print(f"[OK] {report.name} — pdf ready")
 
 
-async def _scheduler_forever(runner: ReportRunner, reports: Iterable[ReportConfig], tz: ZoneInfo) -> None:
+async def _scheduler_forever(
+    runner: ReportRunner,
+    reports: Iterable[ReportConfig],
+    tz: ZoneInfo,
+    queue: JobQueue,
+) -> None:
     scheduler = AsyncIOScheduler(timezone=str(tz))
 
     async def _execute_report(report: ReportConfig) -> None:
         print(f"[DEBUG] Job triggered for {report.name} at {asyncio.get_event_loop().time()}")
         try:
-            print(f"[DEBUG] Starting PDF generation for {report.name}")
-            pdf_path = await runner.generate_pdf(report, tz, send_mail=True)
+            pdf_path = await queue.submit(
+                report.name,
+                lambda r=report: runner.generate_pdf(r, tz, send_mail=True),
+            )
             print(f"[SENT] {report.name} — scheduled run complete, PDF: {pdf_path}")
         except Exception as exc:  # noqa: BLE001
             import traceback
@@ -95,7 +103,15 @@ async def _run_api_server(host: str, port: int) -> None:
 
 
 async def _run_daemon(runner: ReportRunner, reports: list[ReportConfig], tz: ZoneInfo, host: str, port: int) -> None:
-    scheduler_task = asyncio.create_task(_scheduler_forever(runner, reports, tz))
+    queue = JobQueue(concurrency=runner.settings.run_all_concurrency)
+    await queue.start()
+
+    # Share the queue with the API module so HTTP-triggered exports
+    # go through the same concurrency-limited pipeline.
+    from reporting import api as api_module
+    api_module.set_job_queue(queue)
+
+    scheduler_task = asyncio.create_task(_scheduler_forever(runner, reports, tz, queue))
     api_task = asyncio.create_task(_run_api_server(host, port))
     tasks = {scheduler_task, api_task}
     print("[DAEMON] Scheduler + API running. Ctrl+C to stop both.")
@@ -111,6 +127,7 @@ async def _run_daemon(runner: ReportRunner, reports: list[ReportConfig], tz: Zon
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await queue.stop()
 
 
 async def main() -> None:
@@ -150,8 +167,13 @@ async def main() -> None:
         await _run_daemon(runner, reports, tz, args.api_host, args.api_port)
         return
 
+    queue = JobQueue(concurrency=settings.run_all_concurrency)
+    await queue.start()
     print("[RUNNING] Scheduler active. Ctrl+C to stop.")
-    await _scheduler_forever(runner, reports, tz)
+    try:
+        await _scheduler_forever(runner, reports, tz, queue)
+    finally:
+        await queue.stop()
 
 
 if __name__ == "__main__":
