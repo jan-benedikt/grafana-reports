@@ -13,12 +13,17 @@ from .util import is_valid_dashboard_uid, sanitize_filename
 
 logger = logging.getLogger(__name__)
 
+# Module-level defaults: with @dataclass(slots=True), class-attribute access
+# (e.g. EmailConfig.subject) returns a member descriptor, not the default value.
+DEFAULT_EMAIL_SUBJECT = "{{ name }} – {{ period_from_human }} → {{ period_to_human }}"
+DEFAULT_EMAIL_BODY = "Report period: {{ period_from_human }} – {{ period_to_human }}."
+
 
 @dataclass(slots=True)
 class EmailConfig:
     to: list[str] = field(default_factory=list)
-    subject: str = "{{ name }} – {{ period_from_human }} → {{ period_to_human }}"
-    body: str = "Report period: {{ period_from_human }} – {{ period_to_human }}."
+    subject: str = DEFAULT_EMAIL_SUBJECT
+    body: str = DEFAULT_EMAIL_BODY
     body_html: str | None = None
     filename_prefix: str | None = None
 
@@ -39,7 +44,7 @@ class ReportConfig:
     name: str
     dashboard_uid: str
     vars: dict[str, Any] = field(default_factory=dict)
-    time_from: str = "now-7d"
+    time_from: str = "now-30d"
     time_to: str = "now"
     cron: str = "0 7 1 * *"
     email: EmailConfig = field(default_factory=EmailConfig)
@@ -56,15 +61,33 @@ class ConfigError(ValueError):
 
 def _parse_render(raw: dict[str, Any] | None) -> RenderConfig:
     raw = raw or {}
-    width = raw.get("width")
-    page_height = raw.get("page_height_px")
-    scale = raw.get("scale_factor")
+    if not isinstance(raw, dict):
+        raise ConfigError("render must be a mapping")
+    try:
+        width = int(raw["width"]) if raw.get("width") is not None else None
+        page_height = int(raw["page_height_px"]) if raw.get("page_height_px") is not None else None
+        scale = float(raw["scale_factor"]) if raw.get("scale_factor") is not None else None
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"invalid render value: {exc}") from exc
+
+    page_mode = str(raw["page_mode"]).lower() if raw.get("page_mode") else None
+
+    # Same bounds as the API's _parse_render_overrides
+    if width is not None and not (320 <= width <= 7680):
+        raise ConfigError(f"render.width must be between 320 and 7680 (got {width})")
+    if page_height is not None and not (200 <= page_height <= 20000):
+        raise ConfigError(f"render.page_height_px must be between 200 and 20000 (got {page_height})")
+    if scale is not None and not (0.5 <= scale <= 4.0):
+        raise ConfigError(f"render.scale_factor must be between 0.5 and 4.0 (got {scale})")
+    if page_mode is not None and page_mode not in {"auto", "a4", "css", "paged"}:
+        raise ConfigError(f"render.page_mode must be one of auto|a4|css|paged (got '{page_mode}')")
+
     return RenderConfig(
-        width=int(width) if width is not None else None,
-        page_mode=(str(raw["page_mode"]).lower() if raw.get("page_mode") else None),
-        page_height_px=int(page_height) if page_height is not None else None,
+        width=width,
+        page_mode=page_mode,
+        page_height_px=page_height,
         theme=(str(raw["theme"]).lower() if raw.get("theme") else None),
-        scale_factor=float(scale) if scale is not None else None,
+        scale_factor=scale,
     )
 
 
@@ -114,6 +137,10 @@ def load_reports_config(path: Path, default_tz: str) -> tuple[str, list[ReportCo
                 raise ConfigError(f"reports[{idx}] ('{name}') invalid cron '{cron}': {exc}") from exc
 
         email_raw = item.get("email", {}) or {}
+        try:
+            render = _parse_render(item.get("render"))
+        except ConfigError as exc:
+            raise ConfigError(f"reports[{idx}] ('{name}') {exc}") from exc
         report = ReportConfig(
             name=str(name),
             dashboard_uid=str(uid),
@@ -123,12 +150,12 @@ def load_reports_config(path: Path, default_tz: str) -> tuple[str, list[ReportCo
             cron=str(cron),
             email=EmailConfig(
                 to=list(email_raw.get("to", [])),
-                subject=email_raw.get("subject", EmailConfig.subject),
-                body=email_raw.get("body", EmailConfig.body),
+                subject=email_raw.get("subject", DEFAULT_EMAIL_SUBJECT),
+                body=email_raw.get("body", DEFAULT_EMAIL_BODY),
                 body_html=email_raw.get("body_html"),
                 filename_prefix=email_raw.get("filename_prefix"),
             ),
-            render=_parse_render(item.get("render")),
+            render=render,
         )
         reports.append(report)
 

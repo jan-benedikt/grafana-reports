@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from pathlib import Path
 from typing import Any
@@ -9,7 +10,14 @@ from urllib.parse import urlparse
 from playwright.async_api import Browser, BrowserContext, Playwright, TimeoutError as PWTimeoutError
 from playwright.async_api import async_playwright
 
-from .layout import MEASURE_HEIGHT_JS, PAGINATE_JS, PREPARE_PRINT_JS, height_from_grid_positions
+from .layout import (
+    MEASURE_HEIGHT_JS,
+    OPTIMIZE_TABLES_FOR_PDF_JS,
+    PAGINATE_JS,
+    PREPARE_PRINT_JS,
+    clamp_viewport_height,
+    height_from_grid_positions,
+)
 from .models import RenderConfig
 from .settings import Settings
 
@@ -28,6 +36,10 @@ class GrafanaPDFRenderer:
 
     async def start(self) -> None:
         await self._ensure_browser()
+
+    def is_connected(self) -> bool:
+        """True if the shared Chromium instance is up and connected."""
+        return bool(self._browser and self._browser.is_connected())
 
     async def stop(self) -> None:
         async with self._browser_lock:
@@ -132,10 +144,25 @@ class GrafanaPDFRenderer:
 
             # Measure real dashboard height and expand viewport so all panels paint
             measured = await self._measure_height(page, dashboard_json)
-            target_height = min(
-                max(measured["totalHeight"], self.settings.viewport_height),
-                self.settings.pdf_max_viewport_height,
+            desired_height = max(measured["totalHeight"], self.settings.viewport_height)
+            target_height = clamp_viewport_height(
+                desired_height,
+                width=width,
+                scale=scale,
+                max_height=self.settings.pdf_max_viewport_height,
+                pixel_budget=self.settings.pdf_max_render_pixels,
+                min_height=min(self.settings.viewport_height, desired_height),
             )
+            if target_height < desired_height:
+                logger.warning(
+                    "Viewport height clamped %s -> %s (width=%s scale=%s max=%s budget=%spx) to bound memory",
+                    desired_height,
+                    target_height,
+                    width,
+                    scale,
+                    self.settings.pdf_max_viewport_height,
+                    self.settings.pdf_max_render_pixels,
+                )
             logger.info(
                 "Dashboard height measured via %s: content=%s total=%s -> viewport height=%s",
                 measured.get("source"),
@@ -173,7 +200,7 @@ class GrafanaPDFRenderer:
 
             logger.info("Generating PDF with mode=%s", size_mode)
             if size_mode == "a4":
-                await page.pdf(
+                await self._print_pdf(page,
                     path=str(output_pdf),
                     format=self.settings.pdf_paper_format,
                     landscape=self.settings.pdf_landscape,
@@ -183,7 +210,7 @@ class GrafanaPDFRenderer:
                     prefer_css_page_size=False,
                 )
             elif size_mode == "css":
-                await page.pdf(
+                await self._print_pdf(page,
                     path=str(output_pdf),
                     landscape=self.settings.pdf_landscape,
                     print_background=True,
@@ -210,7 +237,7 @@ class GrafanaPDFRenderer:
                         arg=int(measured.get("totalHeight") or 0),
                         default=0,
                     )
-                    await page.pdf(
+                    await self._print_pdf(page,
                         path=str(output_pdf),
                         width=f"{width_in}in",
                         height=f"{height_in}in",
@@ -255,7 +282,7 @@ class GrafanaPDFRenderer:
             logger.warning("Pagination JS failed (%s); using single-page auto sizing", result.get("reason"))
             width_in, height_in = await self._compute_pdf_dimensions(page, measured, width=width)
             await self._safe_eval(page, PREPARE_PRINT_JS, arg=int(measured.get("totalHeight") or 0), default=0)
-            await page.pdf(
+            await self._print_pdf(page,
                 path=str(output_pdf),
                 width=f"{width_in}in",
                 height=f"{min(height_in, self.settings.pdf_max_inch)}in",
@@ -282,7 +309,7 @@ class GrafanaPDFRenderer:
             page_height_px,
             final_h,
         )
-        await page.pdf(
+        await self._print_pdf(page,
             path=str(output_pdf),
             width=f"{width}px",
             height=f"{page_height_px}px",
@@ -292,6 +319,93 @@ class GrafanaPDFRenderer:
             display_header_footer=False,
             prefer_css_page_size=False,
         )
+
+    async def _print_pdf(self, page, **kwargs: Any) -> None:
+        await self._optimize_tables_for_pdf(page)
+        await page.pdf(**kwargs)
+
+    async def _optimize_tables_for_pdf(self, page) -> None:
+        """Drop per-cell gradients, shadows, and soft masks before print."""
+        if not self.settings.pdf_simplify_tables:
+            return
+        try:
+            result = await page.evaluate(OPTIMIZE_TABLES_FOR_PDF_JS)
+        except Exception:
+            logger.warning("Table PDF simplification failed", exc_info=True)
+            return
+        if not isinstance(result, dict):
+            return
+        if result.get("error"):
+            logger.warning("Table PDF simplification skipped: %s", result.get("error"))
+            return
+
+        flattened = int(result.get("flattened") or 0)
+        opacity_fixed = int(result.get("opacityFixed") or 0)
+        rasterized = 0
+        for item in result.get("rasterize") or []:
+            if not isinstance(item, dict):
+                continue
+            table_id = str(item.get("id") or "")
+            if not table_id.isdigit():
+                continue
+            try:
+                width = float(item.get("width") or 0)
+                height = float(item.get("height") or 0)
+            except (TypeError, ValueError):
+                continue
+            try:
+                if await self._rasterize_table(page, table_id, width, height):
+                    rasterized += 1
+                    logger.info(
+                        "Rasterized table %s (%s bar fills, %.0fx%.0f CSS px) to one image",
+                        table_id,
+                        item.get("complex"),
+                        width,
+                        height,
+                    )
+            except Exception:
+                logger.warning("Failed to rasterize table %s", table_id, exc_info=True)
+
+        if flattened or opacity_fixed or rasterized:
+            logger.info(
+                "Simplified tables for PDF: %s solid fills, %s opacities, %s rasterized table(s)",
+                flattened,
+                opacity_fixed,
+                rasterized,
+            )
+
+    async def _rasterize_table(self, page, table_id: str, width: float, height: float) -> bool:
+        if width < 2 or height < 2:
+            return False
+        locator = page.locator(f'[data-pdf-table-id="{table_id}"]')
+        if await locator.count() != 1:
+            return False
+        shot = await locator.screenshot(type="jpeg", quality=90, animations="disabled")
+        if not shot:
+            return False
+        data_url = "data:image/jpeg;base64," + base64.b64encode(shot).decode("ascii")
+        await locator.evaluate(
+            """(el, src) => {
+                const rect = el.getBoundingClientRect();
+                const w = rect.width;
+                const h = rect.height;
+                el.replaceChildren();
+                el.style.setProperty('background', 'none', 'important');
+                el.style.setProperty('background-image', 'none', 'important');
+                el.style.setProperty('overflow', 'hidden', 'important');
+                el.style.setProperty('width', w + 'px', 'important');
+                el.style.setProperty('height', h + 'px', 'important');
+                const img = document.createElement('img');
+                img.alt = '';
+                img.src = src;
+                img.style.cssText = 'display:block;width:' + w + 'px;height:' + h + 'px;border:0;';
+                el.appendChild(img);
+                if (img.decode) return img.decode().catch(() => {});
+                return null;
+            }""",
+            data_url,
+        )
+        return True
 
     def _make_route_handler(self):
         grafana_host = urlparse(self.settings.grafana_url).hostname

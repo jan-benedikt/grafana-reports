@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from zoneinfo import ZoneInfo
 
 from .auth import RequireApiKey
@@ -17,7 +18,7 @@ from .pdf_renderer import GrafanaPDFRenderer
 from .report_service import ReportRunner
 from .settings import settings
 from .time_range import normalize_time_range
-from .util import is_valid_dashboard_uid, resolve_timezone, sanitize_filename
+from .util import is_valid_dashboard_uid, pdf_sweeper_loop, resolve_timezone, sanitize_filename
 
 try:
     import requests
@@ -38,6 +39,8 @@ _mailer = EmailService(settings)
 _runner = ReportRunner(settings, _renderer, _mailer)
 
 _job_queue: JobQueue | None = None
+_owns_job_queue = False
+_sweeper_task: asyncio.Task | None = None
 
 _MAX_VARS = 50
 _MAX_VAR_LEN = 512
@@ -171,17 +174,45 @@ def _parse_render_overrides(
 
 @app.on_event("startup")
 async def _startup():
+    global _job_queue, _owns_job_queue, _sweeper_task
     await _renderer.start()
+    if _job_queue is None:
+        # Standalone API mode: bound concurrency the same way the daemon does
+        _job_queue = JobQueue(
+            concurrency=settings.run_all_concurrency,
+            max_pending=settings.queue_max_pending,
+            job_timeout_s=settings.job_timeout_s,
+        )
+        _owns_job_queue = True
+        await _job_queue.start()
+    if _sweeper_task is None and settings.pdf_retention_hours > 0:
+        _sweeper_task = asyncio.create_task(
+            pdf_sweeper_loop(settings.pdf_outdir, settings.pdf_retention_hours * 3600)
+        )
 
 
 @app.on_event("shutdown")
 async def _shutdown():
+    global _job_queue, _owns_job_queue, _sweeper_task
+    if _sweeper_task is not None:
+        _sweeper_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _sweeper_task
+        _sweeper_task = None
+    if _owns_job_queue and _job_queue is not None:
+        await _job_queue.stop()
+        _job_queue = None
+        _owns_job_queue = False
     await _renderer.stop()
 
 
 @app.get("/healthz", tags=["health"])
 async def healthz():
-    return {"status": "ok", "reports_loaded": len(_report_by_uid)}
+    return {
+        "status": "ok",
+        "reports_loaded": len(_report_by_uid),
+        "browser_connected": _renderer.is_connected(),
+    }
 
 
 @app.get("/readyz", tags=["health"])
@@ -273,25 +304,58 @@ async def pdf_export(
             render=report.render,
         )
 
-    try:
+    async def _generate() -> Path:
         if _job_queue is not None:
-            pdf_path = await _job_queue.submit(
+            return await _job_queue.submit(
                 f"API: {report.name}",
                 lambda r=report, t=tz, f=from_, tt=to, ro=render_overrides: _runner.generate_pdf(
                     r, t, time_from=f, time_to=tt, send_mail=False, render_overrides=ro
                 ),
             )
-        else:
-            pdf_path = await _runner.generate_pdf(
-                report,
-                tz,
-                time_from=from_,
-                time_to=to,
-                send_mail=False,
-                render_overrides=render_overrides,
-            )
+        coro = _runner.generate_pdf(
+            report,
+            tz,
+            time_from=from_,
+            time_to=to,
+            send_mail=False,
+            render_overrides=render_overrides,
+        )
+        if settings.job_timeout_s > 0:
+            return await asyncio.wait_for(coro, timeout=settings.job_timeout_s)
+        return await coro
+
+    gen_task = asyncio.create_task(_generate())
+    try:
+        while True:
+            done, _ = await asyncio.wait({gen_task}, timeout=1.0)
+            if done:
+                pdf_path = gen_task.result()
+                break
+            if await request.is_disconnected():
+                # Cancel the render (direct mode) or retract/abandon the job
+                # (queue mode); a running queued job still finishes and its
+                # file is removed by the retention sweeper.
+                gen_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await gen_task
+                logger.warning("Client disconnected during PDF generation for %s; response abandoned", uid)
+                return Response(status_code=499)
     except QueueFullError as e:
         raise HTTPException(status_code=429, detail=str(e)) from e
+    except TimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail=f"PDF generation exceeded {settings.job_timeout_s:.0f}s",
+        ) from e
+
+    if await request.is_disconnected():
+        # Keep the file for the retention sweeper so operators can recover it
+        logger.warning(
+            "Client disconnected after PDF generation for %s; file kept until sweep: %s",
+            uid,
+            pdf_path,
+        )
+        return Response(status_code=499)
 
     background_tasks.add_task(_cleanup_file, pdf_path)
     return FileResponse(

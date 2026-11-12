@@ -90,3 +90,59 @@ async def test_status_reports_active_job():
     finally:
         gate.set()
         await queue.stop()
+
+
+@pytest.mark.asyncio
+async def test_job_timeout_frees_worker():
+    queue = JobQueue(concurrency=1, max_pending=5, job_timeout_s=0.1)
+
+    async def _hang():
+        await asyncio.sleep(30)
+
+    await queue.start()
+    try:
+        with pytest.raises(TimeoutError):
+            await queue.submit("hung", _hang)
+        # Worker must be free again for the next job
+        result = await asyncio.wait_for(
+            queue.submit("next", lambda: asyncio.sleep(0, result="ok")), timeout=2
+        )
+        assert result == "ok"
+        assert queue.status()["total_failed"] == 1
+    finally:
+        await queue.stop()
+
+
+@pytest.mark.asyncio
+async def test_abandoned_queued_job_is_skipped():
+    """A job whose submitter was cancelled while queued must not run (regression)."""
+    queue = JobQueue(concurrency=1, max_pending=5)
+    await queue.start()
+    gate = asyncio.Event()
+    ran: list[str] = []
+
+    async def _block():
+        await gate.wait()
+        return "done"
+
+    async def _tracked():
+        ran.append("tracked")
+        return "late"
+
+    try:
+        first = asyncio.create_task(queue.submit("a", _block))
+        await asyncio.sleep(0.05)
+        second = asyncio.create_task(queue.submit("b", _tracked))
+        await asyncio.sleep(0.05)
+
+        second.cancel()  # client disconnects while job 'b' is still queued
+        with pytest.raises(asyncio.CancelledError):
+            await second
+
+        gate.set()
+        assert await first == "done"
+        await asyncio.sleep(0.1)  # give the worker a chance to (not) run 'b'
+        assert ran == []
+    finally:
+        gate.set()
+        await queue.stop()

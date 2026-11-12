@@ -114,18 +114,20 @@ class EmailService:
             raise RuntimeError(f"Invalid SMTP_TLS_MODE '{tls_mode}' (expected starttls|ssl|none)")
 
         context = ssl.create_default_context()
+        timeout = self.settings.smtp_timeout_s or 30
         if tls_mode == "ssl":
             with smtplib.SMTP_SSL(
                 self.settings.smtp_host,
                 self.settings.smtp_port,
                 context=context,
+                timeout=timeout,
             ) as server:
                 if self.settings.smtp_user:
                     server.login(self.settings.smtp_user, self.settings.smtp_pass)
                 server.send_message(msg)
             return
 
-        with smtplib.SMTP(self.settings.smtp_host, self.settings.smtp_port) as server:
+        with smtplib.SMTP(self.settings.smtp_host, self.settings.smtp_port, timeout=timeout) as server:
             if tls_mode == "starttls":
                 try:
                     server.starttls(context=context)
@@ -157,11 +159,12 @@ class EmailService:
         if requests is None:
             raise RuntimeError("The 'requests' package is required for SendGrid support")
 
-        from_email = self.settings.sendgrid_from or self._extract_plain_email(self.settings.email_from)
+        from_name, from_email = parseaddr(self.settings.sendgrid_from or self.settings.email_from)
         if not from_email:
             raise RuntimeError("Unable to determine From email for SendGrid")
 
-        reply_to = self.settings.sendgrid_reply_to or None
+        _, reply_to = parseaddr(self.settings.sendgrid_reply_to or "")
+        reply_to = reply_to or None
 
         with open(pdf_file, "rb") as handle:
             attachment_content = base64.b64encode(handle.read()).decode("ascii")
@@ -201,7 +204,7 @@ class EmailService:
                     "to": [{"email": addr} for addr in to_list],
                 }
             ],
-            "from": {"email": from_email},
+            "from": ({"email": from_email, "name": from_name} if from_name else {"email": from_email}),
             "subject": subject,
             "content": contents,
             "attachments": attachments,
@@ -228,19 +231,28 @@ class EmailService:
                     timeout=30,
                 )
                 logger.debug("SendGrid response: %s", response.status_code)
-                if response.status_code >= 400:
-                    body = (response.text or "")[:300]
+                if response.status_code < 400:
+                    return
+                body = (response.text or "")[:300]
+                if response.status_code == 429 or response.status_code >= 500:
+                    # Transient — worth retrying
+                    last_error = RuntimeError(f"SendGrid API error {response.status_code}: {body}")
+                    logger.warning("SendGrid transient error on attempt %d/%d: %s", attempt, max_retries, last_error)
+                else:
+                    # Client error (bad payload/auth) — retrying cannot succeed
                     raise RuntimeError(f"SendGrid API error {response.status_code}: {body}")
-                return
             except requests.exceptions.RequestException as e:
+                # NOTE: a timeout after SendGrid accepted the message can cause a
+                # duplicate send on retry; SendGrid offers no idempotency key.
                 last_error = e
                 logger.warning("SendGrid request error on attempt %d/%d: %s", attempt, max_retries, e)
-                if attempt < max_retries:
-                    wait_time = retry_delay * attempt
-                    logger.debug("Retrying in %d seconds...", wait_time)
-                    time.sleep(wait_time)
-                    session = requests.Session()
-                    self._http_session = session
+
+            if attempt < max_retries:
+                wait_time = retry_delay * attempt
+                logger.debug("Retrying in %d seconds...", wait_time)
+                time.sleep(wait_time)
+                session = requests.Session()
+                self._http_session = session
 
         raise RuntimeError(f"Failed to send email after {max_retries} attempts: {last_error}")
 
@@ -268,8 +280,3 @@ class EmailService:
                     }
                 )
         return collected
-
-    @staticmethod
-    def _extract_plain_email(value: str) -> str | None:
-        _, email = parseaddr(value)
-        return email or value

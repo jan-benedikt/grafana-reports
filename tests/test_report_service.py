@@ -114,3 +114,46 @@ async def test_generate_pdf_merges_render_overrides(runner):
     assert render.page_mode == "paged"
     assert render.width == 1920  # from base
     assert render.theme == "dark"
+
+
+@pytest.mark.asyncio
+async def test_email_failure_still_deletes_pdf(tmp_path):
+    """A failed delivery must not leak the rendered PDF (regression)."""
+    settings = Settings(pdf_outdir=tmp_path, email_enabled=True)
+    renderer = MagicMock()
+
+    async def _fake_render(url, output_pdf, *a, **kw):
+        Path(output_pdf).write_bytes(b"%PDF-1.4 x")
+
+    renderer.render_url = AsyncMock(side_effect=_fake_render)
+    mailer = MagicMock()
+    mailer.send = MagicMock(side_effect=RuntimeError("smtp down"))
+    runner = ReportRunner(settings, renderer, mailer)
+    report = ReportConfig(
+        name="Mail fail",
+        dashboard_uid="abc123",
+        email=EmailConfig(to=["ops@example.com"]),
+    )
+
+    with pytest.raises(RuntimeError, match="smtp down"):
+        await runner.generate_pdf(report, ZoneInfo("UTC"), send_mail=True)
+    assert list(tmp_path.glob("*.pdf")) == []
+
+
+@pytest.mark.asyncio
+async def test_send_mail_false_does_not_touch_email_templates(tmp_path):
+    """API exports must not depend on email template validity (regression)."""
+    settings = Settings(pdf_outdir=tmp_path, email_enabled=True)
+    renderer = MagicMock()
+    renderer.render_url = AsyncMock()
+    mailer = MagicMock()
+    runner = ReportRunner(settings, renderer, mailer)
+    report = ReportConfig(
+        name="Broken template",
+        dashboard_uid="abc123",
+        email=EmailConfig(to=["ops@example.com"], body="{% broken jinja"),
+    )
+
+    path = await runner.generate_pdf(report, ZoneInfo("UTC"), send_mail=False)
+    assert path.suffix == ".pdf"
+    mailer.send.assert_not_called()

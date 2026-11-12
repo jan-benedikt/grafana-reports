@@ -40,9 +40,15 @@ class JobQueue:
     result (or raises) once the job finishes, so callers can ``await`` it.
     """
 
-    def __init__(self, concurrency: int = 2, max_pending: int = 10) -> None:
+    def __init__(
+        self,
+        concurrency: int = 2,
+        max_pending: int = 10,
+        job_timeout_s: float | None = None,
+    ) -> None:
         self._concurrency = max(1, concurrency)
         self._max_pending = max(1, max_pending)
+        self._job_timeout_s = job_timeout_s if job_timeout_s and job_timeout_s > 0 else None
         self._queue: asyncio.Queue[_Job] = asyncio.Queue()
         self._workers: list[asyncio.Task] = []
         self._active: dict[int, _ActiveJob] = {}
@@ -127,6 +133,12 @@ class JobQueue:
     async def _worker(self, worker_id: int) -> None:
         while True:
             job = await self._queue.get()
+            if job.future.done():
+                # Caller gave up (e.g. client disconnected) while the job was
+                # still queued — skip it instead of rendering for nobody.
+                logger.info("Worker %d skipping '%s' (abandoned while queued)", worker_id, job.name)
+                self._queue.task_done()
+                continue
             loop = asyncio.get_running_loop()
             wait_s = loop.time() - job.enqueued_at
             if wait_s >= 0.5:
@@ -142,7 +154,11 @@ class JobQueue:
             active = _ActiveJob(id=job.id, name=job.name, worker_id=worker_id, started_at=loop.time())
             self._active[worker_id] = active
             try:
-                result = await job.coro_factory()
+                coro = job.coro_factory()
+                if self._job_timeout_s is not None:
+                    result = await asyncio.wait_for(coro, timeout=self._job_timeout_s)
+                else:
+                    result = await coro
                 if not job.future.done():
                     job.future.set_result(result)
                 self._total_completed += 1

@@ -29,6 +29,30 @@ spec:
     customRequestHeaders:
       X-Forwarded-Prefix: /pdf-export
 ---
+# Browser Grafana sessions are unrelated to the exporter's API-key auth.
+# Do not forward same-origin cookies to the PDF backend.
+apiVersion: "traefik.io/v1alpha1"
+kind: Middleware
+metadata:
+  name: strip-report-cookies
+  namespace: grafana-reports
+spec:
+  headers:
+    customRequestHeaders:
+      Cookie: ""
+---
+# PDF generation holds the request open until the file is ready (often
+# minutes). Without this transport, any proxy-level response-header timeout
+# returns 504 to the browser while the server keeps rendering.
+apiVersion: "traefik.io/v1alpha1"
+kind: ServersTransport
+metadata:
+  name: grafana-reports-slow
+  namespace: grafana-reports
+spec:
+  forwardingTimeouts:
+    responseHeaderTimeout: "600s"
+---
 apiVersion: "traefik.io/v1alpha1"
 kind: "IngressRoute"
 metadata:
@@ -60,10 +84,12 @@ spec:
       match: "Host(`grafana.example.com`) && PathPrefix(`/pdf-export/`)"
       priority: 30
       middlewares:
+        - name: strip-report-cookies
         - name: strip-pdf-export
         - name: add-forwarded-prefix
       services:
         - name: grafana-reports
           port: 8080
+          serversTransport: grafana-reports-slow
   tls:
     secretName: grafana-tls

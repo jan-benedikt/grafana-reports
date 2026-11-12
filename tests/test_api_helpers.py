@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from reporting import api as api_mod
@@ -80,3 +81,35 @@ def test_timezone_browser_resolves_like_api():
     # Mirrors api.pdf_export resolution against config timezone name
     tz = resolve_timezone("browser", api_mod._timezone_name)
     assert tz.key == api_mod._timezone_name
+
+
+@pytest.mark.parametrize(
+    "cookie",
+    [None, "grafana_session=synthetic; grafana_session_expiry=synthetic", "synthetic=" + "x" * 32768],
+    ids=["no-cookies", "grafana-cookies", "large-cookie"],
+)
+def test_real_pdf_endpoint_ignores_browser_cookies(tmp_path, monkeypatch, cookie):
+    from reporting.models import ReportConfig
+
+    pdf = tmp_path / "report.pdf"
+    content = b"%PDF-1.4\nsynthetic download fixture\n%%EOF\n"
+    pdf.write_bytes(content)
+    generate = AsyncMock(return_value=pdf)
+    monkeypatch.setattr(api_mod._runner, "generate_pdf", generate)
+    monkeypatch.setattr(api_mod, "_job_queue", None)
+    monkeypatch.setattr(api_mod, "_report_by_uid", {"abc": ReportConfig(name="Test", dashboard_uid="abc")})
+    monkeypatch.setattr(api_mod.settings, "api_keys", ["synthetic-test-key"])
+    headers = {"X-API-Key": "synthetic-test-key"}
+    if cookie is not None:
+        headers["Cookie"] = cookie
+
+    # No context manager: avoid launching Chromium via application startup.
+    with_cookie = TestClient(api_mod.app).get("/abc/?from=now-7d&to=now", headers=headers)
+
+    assert with_cookie.status_code == 200
+    assert with_cookie.content == content
+    assert with_cookie.headers["content-type"] == "application/pdf"
+    assert with_cookie.headers["content-disposition"] == 'inline; filename="report.pdf"'
+    assert "set-cookie" not in with_cookie.headers
+    generate.assert_awaited_once()
+    assert not pdf.exists()

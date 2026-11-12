@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
+import signal
 from pathlib import Path
 from collections.abc import Iterable
 
@@ -20,6 +22,7 @@ from reporting.logging_config import configure_logging
 from reporting.models import ReportConfig, load_reports_config
 from reporting.pdf_renderer import GrafanaPDFRenderer
 from reporting.report_service import ReportRunner, run_all_reports
+from reporting.util import pdf_sweeper_loop
 
 logger = logging.getLogger(__name__)
 
@@ -89,25 +92,31 @@ async def _scheduler_forever(
         raise
 
 
-async def _run_api_server(host: str, port: int) -> None:
-    try:
-        import uvicorn
-    except ImportError as exc:  # pragma: no cover - optional dependency
-        raise SystemExit(
-            "Uvicorn is required for daemon mode. Install it via 'pip install uvicorn[standard]'."
-        ) from exc
+def _install_stop_handlers(loop: asyncio.AbstractEventLoop) -> tuple[asyncio.Event, callable]:
+    """Install SIGTERM/SIGINT handlers that request a graceful shutdown.
 
-    from reporting.api import app  # Local import to avoid unneeded FastAPI dependency for CLI-only use
+    uvicorn captures these signals during ``serve()`` and *re-raises* them
+    afterwards; with the default disposition that kills the process before any
+    cleanup can run. Our handler absorbs the re-raise and sets a stop event.
+    Returns the event and a restore callback.
+    """
+    stop_event = asyncio.Event()
 
-    config = uvicorn.Config(app, host=host, port=port, loop="asyncio", log_level="info")
-    server = uvicorn.Server(config)
-    logger.info("FastAPI server listening on http://%s:%s", host, port)
+    def _handler(signum, frame):  # noqa: ARG001
+        logger.info("Received signal %s; initiating graceful shutdown", signum)
+        loop.call_soon_threadsafe(stop_event.set)
 
-    try:
-        await server.serve()
-    except asyncio.CancelledError:
-        server.should_exit = True
-        raise
+    previous = {
+        sig: signal.signal(sig, _handler)
+        for sig in (signal.SIGTERM, signal.SIGINT)
+    }
+
+    def _restore() -> None:
+        for sig, handler in previous.items():
+            with contextlib.suppress(Exception):
+                signal.signal(sig, handler)
+
+    return stop_event, _restore
 
 
 async def _run_daemon(
@@ -117,38 +126,66 @@ async def _run_daemon(
     host: str,
     port: int,
 ) -> None:
+    try:
+        import uvicorn
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise SystemExit(
+            "Uvicorn is required for daemon mode. Install it via 'pip install uvicorn[standard]'."
+        ) from exc
+
+    from reporting.api import app  # Local import to avoid unneeded FastAPI dependency for CLI-only use
+    from reporting import api as api_module
+
     await runner.renderer.start()
     queue = JobQueue(
         concurrency=runner.settings.run_all_concurrency,
         max_pending=runner.settings.queue_max_pending,
+        job_timeout_s=runner.settings.job_timeout_s,
     )
     await queue.start()
 
     # Share the queue with the API module so HTTP-triggered exports
     # go through the same concurrency-limited pipeline.
-    from reporting import api as api_module
-
     api_module.set_runner(runner)
     api_module.set_job_queue(queue)
 
+    loop = asyncio.get_running_loop()
+    stop_event, restore_signals = _install_stop_handlers(loop)
+
+    config = uvicorn.Config(app, host=host, port=port, loop="asyncio", log_level="info")
+    server = uvicorn.Server(config)
+    logger.info("FastAPI server listening on http://%s:%s", host, port)
+
     scheduler_task = asyncio.create_task(_scheduler_forever(runner, reports, tz, queue))
-    api_task = asyncio.create_task(_run_api_server(host, port))
-    tasks = {scheduler_task, api_task}
+    api_task = asyncio.create_task(server.serve())
+    stop_task = asyncio.create_task(stop_event.wait())
     logger.info("DAEMON Scheduler + API running. Ctrl+C to stop both.")
 
     try:
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-        for task in done:
+        done, _ = await asyncio.wait(
+            {scheduler_task, api_task, stop_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done & {scheduler_task, api_task}:
             exc = task.exception()
             if exc:
                 raise exc
+        if stop_task in done:
+            logger.info("Shutdown requested; stopping scheduler and API…")
     finally:
-        for task in tasks:
+        server.should_exit = True
+        for task in (scheduler_task, stop_task):
             if not task.done():
                 task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # Give uvicorn a bounded window to close connections gracefully
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(api_task), timeout=10)
+        if not api_task.done():
+            api_task.cancel()
+        await asyncio.gather(scheduler_task, api_task, stop_task, return_exceptions=True)
         await queue.stop()
         await runner.renderer.stop()
+        restore_signals()
 
 
 async def main() -> None:
@@ -198,14 +235,36 @@ async def main() -> None:
     queue = JobQueue(
         concurrency=settings.run_all_concurrency,
         max_pending=settings.queue_max_pending,
+        job_timeout_s=settings.job_timeout_s,
     )
     await queue.start()
+    loop = asyncio.get_running_loop()
+    stop_event, restore_signals = _install_stop_handlers(loop)
+    scheduler_task = asyncio.create_task(_scheduler_forever(runner, reports, tz, queue))
+    stop_task = asyncio.create_task(stop_event.wait())
+    sweeper_task = (
+        asyncio.create_task(pdf_sweeper_loop(settings.pdf_outdir, settings.pdf_retention_hours * 3600))
+        if settings.pdf_retention_hours > 0
+        else None
+    )
     logger.info("RUNNING Scheduler active. Ctrl+C to stop.")
     try:
-        await _scheduler_forever(runner, reports, tz, queue)
+        done, _ = await asyncio.wait({scheduler_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+        if scheduler_task in done:
+            exc = scheduler_task.exception()
+            if exc:
+                raise exc
     finally:
+        for task in (scheduler_task, stop_task, sweeper_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(t for t in (scheduler_task, stop_task, sweeper_task) if t is not None),
+            return_exceptions=True,
+        )
         await queue.stop()
         await runner.renderer.stop()
+        restore_signals()
 
 
 if __name__ == "__main__":

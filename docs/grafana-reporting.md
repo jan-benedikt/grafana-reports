@@ -103,7 +103,7 @@ curl -L -H "Authorization: Bearer $API_KEY" \
 ## 7. Email Delivery Options
 ### Common switches
 - `EMAIL_BACKEND=smtp` (default) or `sendgrid`.
-- `REPORTS_EMAIL_ENABLED=true` to enable sending.
+- `REPORTS_EMAIL_ENABLED` — **enabled by default**; set `0`/`false` to disable sending.
 
 ### SMTP env vars
 `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `EMAIL_FROM`, `SMTP_TLS_MODE`.
@@ -132,13 +132,18 @@ Per-report `email.body_html` overrides the shared template. Context provides `na
 | `PDF_THEME` | Appended as `theme=` to the dashboard URL (default `light`). |
 | `PDF_MEDIA` | CSS media to emulate: `screen` (default) or `print`. |
 | `PDF_MAX_VIEWPORT_HEIGHT` | Cap when expanding viewport to full dashboard height (default 30000). |
+| `PDF_MAX_RENDER_PIXELS` | Device-pixel budget (`width*scale × height*scale`) for the expanded viewport (default 120000000 ≈ 1 GB Chromium RSS headroom); the viewport is clamped above it. `0` disables. |
 | `PDF_LANDSCAPE`, `PDF_PAPER_FORMAT` | Traditional print options for `a4` / `css` modes. |
 | `WAIT_EXTRA_MS`, `READY_TIMEOUT_MS` | Control how long the renderer waits for panels. |
 | `NETWORK_IDLE_TIMEOUT_MS` | Time (ms) to wait for network idle after load (default 20000). |
 | `WAIT_BEFORE_READY_MS` | Optional delay (ms) before panel-ready checks (default 0). |
 | `CHECK_QUERIES_TO_COMPLETE` | When `true`, wait for Grafana `/api/ds/query` requests to finish. |
 | `PDF_FAST_MODE` | Skips heavy waits for small dashboards. Set to `0` for very slow dashboards. |
+| `PDF_SIMPLIFY_TABLES` | Before print, replace Grafana colored-cell gradients and shadows with solid fills so Acrobat does not paint each cell separately (default `1`). Tables that are mostly translucent gauge bars are snapshotted to one image. Set to `0` to keep the original cell styling. |
 | `PDF_OUTDIR` | Directory where PDFs are written before emailing / download. |
+| `PDF_RETENTION_HOURS` | Orphaned PDFs/screenshots in `PDF_OUTDIR` older than this are deleted by a periodic sweep (default 6; `0` disables). |
+| `JOB_TIMEOUT_S` | End-to-end budget per report job, render + email (default 600; `0` disables). Jobs over budget fail with a timeout. |
+| `SMTP_TIMEOUT` | Socket timeout in seconds for SMTP connections (default 30). |
 | `QUEUE_MAX_PENDING` | Max queued jobs before API returns 429 (default 10). |
 | `GRAFANA_TOKEN` | Service-account token; injected only for requests to the Grafana host. |
 | `API_KEYS` | Comma-separated API keys for HTTP endpoints. |
@@ -149,7 +154,7 @@ Per-report `email.body_html` overrides the shared template. Context provides `na
 2. Measure `.react-grid-layout` height (fallback: `gridPos` from dashboard JSON).
 3. Expand the viewport to the full height so Grafana paints every panel.
 4. Insert gaps between panels so page boundaries never bisect a panel (when possible).
-5. Call `page.pdf({ width, height: pageHeight })` and let Chromium paginate.
+5. Simplify table paint (`PDF_SIMPLIFY_TABLES`), then call `page.pdf({ width, height: pageHeight })` and let Chromium paginate.
 
 `auto` produces a single page sized to content and falls back to `paged` when height would exceed `PDF_MAX_INCH`.
 
@@ -159,6 +164,7 @@ Per-report `email.body_html` overrides the shared template. Context provides `na
 - **Blank / clipped content**: keep `PDF_SIZE_MODE=paged` (or `auto`); the renderer expands the viewport to the full dashboard height, including nested Grafana row layouts.
 - **Playwright login loops**: prefer `GRAFANA_TOKEN`; otherwise verify `GRAFANA_USER`/`GRAFANA_PASSWORD` and dashboard permissions.
 - **Charts or tables empty in PDF**: set `CHECK_QUERIES_TO_COMPLETE=true`, increase `NETWORK_IDLE_TIMEOUT_MS`, or set `PDF_FAST_MODE=0`.
+- **Table PDF opens slowly, cells appear one by one, or Acrobat stops responding**: leave `PDF_SIMPLIFY_TABLES=1` (the default). Colored cells are stored as solid fills instead of one gradient or soft mask each. Set `PDF_SIMPLIFY_TABLES=0` only if you need the original diagonal color sheen or selectable text inside gauge columns.
 - **Email template issues**: confirm paths exist and HTML references `cid` that match filenames inside `EMAIL_TEMPLATE_IMAGES_DIR`.
 
 ## 10. Docker Image
@@ -183,8 +189,14 @@ Per-report `email.body_html` overrides the shared template. Context provides `na
 ### Notes
 - The image is based on `mcr.microsoft.com/playwright/python:v1.64.1-resolute` and installs Chromium during build.
 - Playwright Python package is pinned to the same version as the base image (`1.64.1`).
+- `tini` runs as PID 1 so orphaned Chromium processes are reaped and signals are forwarded.
 - Mount a writable directory to `/tmp/pdfs` (or set `PDF_OUTDIR`) if you want to persist PDFs beyond email attachments / API downloads.
-- Kubernetes manifests under `k8s/` include `securityContext`, `/dev/shm` emptyDir, and higher memory limits suitable for Chromium.
+- Kubernetes manifests under `k8s/` include `securityContext`, probe timeouts, emptyDir size limits, and memory limits sized for Chromium.
+
+### Kubernetes / proxy notes
+- **Run exactly one replica** when using `--daemon`: each replica starts its own scheduler, so more replicas send duplicate report emails.
+- PDF export keeps a single HTTP request open until the file is ready — often minutes. Every hop between the browser and the pod (Traefik, load balancers, CDNs) must allow that long a wait for **response headers**, otherwise the client receives a 504/connection close while the server finishes rendering a PDF nobody can download. `k8s/ingress.yml` ships a Traefik `ServersTransport` with `responseHeaderTimeout: 600s` for this reason; audit any other configured `respondingTimeouts`/`forwardingTimeouts` and upstream proxy timeouts.
+- **Do not inject the API key with proxy middleware** (e.g. a Traefik `headers.customRequestHeaders` middleware adding `X-API-Key`): that makes the export endpoint effectively unauthenticated for anyone who can reach the hostname and stores the key in a non-secret manifest. Require callers to present the key.
 
 ## 11. Tests
 ```
