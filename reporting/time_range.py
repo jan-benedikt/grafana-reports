@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Tuple
-
+from datetime import UTC, datetime
 from dateutil.relativedelta import relativedelta
 from zoneinfo import ZoneInfo
 
@@ -79,7 +77,7 @@ def _evaluate_base_expression(expr: str, tz: ZoneInfo, reference: datetime | Non
         epoch = int(lowered)
         if epoch < 1_000_000_000_000:  # seconds
             epoch *= 1000
-        return datetime.fromtimestamp(epoch / 1000, tz=timezone.utc).astimezone(tz)
+        return datetime.fromtimestamp(epoch / 1000, tz=UTC).astimezone(tz)
 
     iso_value = expr.replace("Z", "+00:00")
     dt = datetime.fromisoformat(iso_value)
@@ -118,13 +116,13 @@ def _is_relative_expression(expr: str) -> bool:
     return lowered == "now" or lowered.startswith("now-") or lowered.startswith("now/")
 
 
-def _format_grafana_value(expr: str, tz: ZoneInfo, evaluated: datetime, reference_used: bool) -> str:
+def _format_grafana_value(expr: str, tz: ZoneInfo, evaluated: datetime) -> str:
     s = expr.strip()
     lowered = s.lower()
     if _is_relative_expression(expr):
         # Grafana often misbehaves with now/M, now-1M/M (and other /round) in URL—use explicit epoch ms
         if "/" in s:
-            return str(int(evaluated.astimezone(timezone.utc).timestamp() * 1000))
+            return str(int(evaluated.astimezone(UTC).timestamp() * 1000))
         return s  # pass through simple now, now-30d, now-1M
 
     if lowered.isdigit():
@@ -133,7 +131,7 @@ def _format_grafana_value(expr: str, tz: ZoneInfo, evaluated: datetime, referenc
             epoch *= 1000
         return str(epoch)
 
-    epoch_ms = int(evaluated.astimezone(timezone.utc).timestamp() * 1000)
+    epoch_ms = int(evaluated.astimezone(UTC).timestamp() * 1000)
     return str(epoch_ms)
 
 
@@ -142,12 +140,7 @@ def normalize_time_range(from_expr: str, to_expr: str, tz: ZoneInfo) -> TimeRang
     start_dt = _evaluate_time_expression(from_expr, tz, reference)
     end_dt = _evaluate_time_expression(to_expr, tz, reference)
 
-    graf_from = _format_grafana_value(from_expr, tz, start_dt, reference_used=True)
-    graf_to = _format_grafana_value(to_expr, tz, end_dt, reference_used=True)
+    graf_from = _format_grafana_value(from_expr, tz, start_dt)
+    graf_to = _format_grafana_value(to_expr, tz, end_dt)
 
     return TimeRangeSpec(grafana_from=graf_from, grafana_to=graf_to, start=start_dt, end=end_dt)
-
-
-def resolve_relative_range(from_expr: str, to_expr: str, tz: ZoneInfo) -> Tuple[datetime, datetime]:
-    spec = normalize_time_range(from_expr, to_expr, tz)
-    return spec.start, spec.end

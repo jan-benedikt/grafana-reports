@@ -3,10 +3,11 @@
 Modular Playwright-based exporter that schedules Grafana dashboards, emails PDFs, and exposes a FastAPI endpoint for ad‑hoc downloads.
 
 ## Features
-- **Accurate PDFs**: waits for panel readiness, injects kiosk CSS, auto-detects dimensions, and supports A4/CSS sizing.
-- **Flexible delivery**: SMTP or SendGrid, plaintext or branded HTML templates with inline images, per-report Jinja subjects/bodies.
-- **Multiple entry points**: CLI for scheduler / batch runs, FastAPI (`uvicorn reporting.api:app`) for API-triggered exports.
-- **Config-driven**: YAML file declares all reports, time ranges, Grafana variables, and email metadata.
+- **Accurate PDFs**: measures the real Grafana grid height, expands the viewport so all panels paint, and supports `paged` (breaks between panels), `auto`, `a4`, or `css` sizing.
+- **Secure API**: exports require an API key (`API_KEYS`); Grafana service-account tokens are supported.
+- **Flexible delivery**: SMTP (STARTTLS/SSL) or SendGrid, plaintext or branded HTML templates with inline images, per-report Jinja subjects/bodies.
+- **Multiple entry points**: CLI for scheduler / batch runs, FastAPI for API-triggered exports, shared Chromium process for efficiency.
+- **Config-driven**: YAML file declares all reports, time ranges, Grafana variables, optional `render:` overrides, and email metadata.
 
 ## Quick Start
 1. Install dependencies (virtualenv recommended):
@@ -15,14 +16,18 @@ Modular Playwright-based exporter that schedules Grafana dashboards, emails PDFs
    playwright install chromium
    ```
 2. Copy `config.yml` and adjust `reports` + `timezone`.
-3. Export env vars (Grafana auth, email backend, PDF tuning). Example:
+3. Export env vars (Grafana auth, API keys, email backend, PDF tuning). Example:
    ```bash
    export GRAFANA_URL="https://grafana.example.com"
    export GRAFANA_USER="report-user"
    export GRAFANA_PASSWORD="secret"
+   # or: export GRAFANA_TOKEN="glsa_..."
+   export API_KEYS="long-random-secret"
    export REPORTS_EMAIL_ENABLED=1
    export EMAIL_BACKEND=smtp
    export SMTP_HOST=mail.example.com
+   export SMTP_TLS_MODE=starttls
+   export PDF_SIZE_MODE=paged
    ```
 4. Run once or start the scheduler:
    ```bash
@@ -33,12 +38,13 @@ Modular Playwright-based exporter that schedules Grafana dashboards, emails PDFs
 5. Optional: serve ad-hoc PDFs via API:
    ```bash
    uvicorn reporting.api:app --port 8080
+   curl -H "X-API-Key: $API_KEYS" "http://localhost:8080/<uid>?from=now-7d&to=now" -o report.pdf
    ```
 
 ## Docker
-Build the container (from the `grafana_reports` directory):
+Build the container (from the repo root):
 ```bash
-docker build -t grafana-reports .
+docker build -t grafana-reports:v1.1.0 .
 ```
 
 Run in daemon mode (scheduler + FastAPI). Mount your config and provide env vars or an env file:
@@ -47,10 +53,15 @@ docker run -d --name grafana-reports \
    -v $(pwd)/config.yml:/app/config.yml:ro \
    --env-file .env \
    -p 8080:8080 \
-   grafana-reports
+   grafana-reports:v1.1.0
 ```
-- Defaults to `--daemon`, so FastAPI listens on port 8080 inside the container.
-- Override behaviour by appending CLI flags, e.g. `docker run grafana-reports --run-once "My Report"`.
+- Defaults to `--daemon` as non-root `pwuser`; FastAPI listens on port 8080.
+- Override behaviour by appending CLI flags, e.g. `docker run grafana-reports:v1.1.0 --run-once "My Report"`.
+
+## Tests
+```bash
+pytest -q
+```
 
 ## Documentation
 Full setup, configuration, and troubleshooting guide: [`docs/grafana-reporting.md`](docs/grafana-reporting.md)

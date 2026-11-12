@@ -1,18 +1,59 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
+from urllib.parse import urlparse
 
-from playwright.async_api import TimeoutError as PWTimeoutError
+from playwright.async_api import Browser, BrowserContext, Playwright, TimeoutError as PWTimeoutError
 from playwright.async_api import async_playwright
 
+from .layout import MEASURE_HEIGHT_JS, PAGINATE_JS, PREPARE_PRINT_JS, height_from_grid_positions
+from .models import RenderConfig
 from .settings import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class GrafanaPDFRenderer:
+    """Renders Grafana dashboards to PDF using a shared Chromium instance."""
+
     def __init__(self, settings: Settings):
         self.settings = settings
+        self._playwright: Playwright | None = None
+        self._browser: Browser | None = None
+        self._browser_lock = asyncio.Lock()
+        self._storage_state: dict | None = None
+
+    async def start(self) -> None:
+        await self._ensure_browser()
+
+    async def stop(self) -> None:
+        async with self._browser_lock:
+            if self._browser:
+                try:
+                    await self._browser.close()
+                except Exception:
+                    logger.debug("Error closing browser", exc_info=True)
+                self._browser = None
+            if self._playwright:
+                try:
+                    await self._playwright.stop()
+                except Exception:
+                    logger.debug("Error stopping playwright", exc_info=True)
+                self._playwright = None
+
+    async def _ensure_browser(self) -> Browser:
+        async with self._browser_lock:
+            if self._browser and self._browser.is_connected():
+                return self._browser
+            if self._playwright is None:
+                self._playwright = await async_playwright().start()
+            chromium_args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+            logger.info("Launching Chromium (args=%s)", chromium_args)
+            self._browser = await self._playwright.chromium.launch(args=chromium_args, headless=True)
+            return self._browser
 
     async def render_url(
         self,
@@ -21,25 +62,27 @@ class GrafanaPDFRenderer:
         header_title: str,
         header_period: str,
         header_generated: str,
+        render: RenderConfig | None = None,
     ) -> None:
-        print(f"[DEBUG] render_url: Starting Playwright for {header_title}")
-        async with async_playwright() as p:
-            chromium_args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
-            print(f"[DEBUG] render_url: Launching browser with args: {chromium_args}")
-            browser = await p.chromium.launch(args=chromium_args, headless=True)
-            print(f"[DEBUG] render_url: Browser launched successfully")
-            print(f"[DEBUG] render_url: Creating browser context")
+        render = render or RenderConfig()
+        width = render.width or self.settings.viewport_width
+        scale = render.scale_factor if render.scale_factor is not None else self.settings.pdf_device_scale_factor
+        size_mode = (render.page_mode or self.settings.pdf_size_mode or "paged").lower()
+        page_height_px = render.page_height_px or self.settings.effective_page_height_px(width)
+
+        browser = await self._ensure_browser()
+        ctx: BrowserContext | None = None
+        try:
             ctx = await browser.new_context(
-                viewport={"width": self.settings.viewport_width, "height": self.settings.viewport_height},
-                device_scale_factor=1,
+                viewport={"width": width, "height": self.settings.viewport_height},
+                device_scale_factor=scale,
                 locale=self.settings.render_locale,
                 timezone_id=self.settings.render_timezone,
+                storage_state=self._storage_state,
             )
-            print(f"[DEBUG] render_url: Browser context created")
 
-            if self.settings.pdf_fast_mode:
-                print(f"[DEBUG] render_url: Setting up fast mode route filter")
-                await ctx.route("**/*", self._route_filter)
+            if self.settings.pdf_fast_mode or self.settings.grafana_token:
+                await ctx.route("**/*", self._make_route_handler())
 
             if self.settings.force_kiosk_css:
                 await ctx.add_init_script(
@@ -53,65 +96,83 @@ class GrafanaPDFRenderer:
                     """
                 )
 
-            print(f"[DEBUG] render_url: Creating new page")
             page = await ctx.new_page()
-            print(f"[DEBUG] render_url: Page created")
 
             if self.settings.debug_render:
                 page.on("requestfailed", lambda req: self._log_request_failure(req))
-                page.on("pageerror", lambda msg: print(f"[PAGE ERROR] {msg}"))
+                page.on("pageerror", lambda msg: logger.warning("PAGE ERROR: %s", msg))
 
-            print(f"[DEBUG] render_url: Ensuring session cookie")
-            await self._ensure_session_cookie(ctx)
-            print(f"[DEBUG] render_url: Session cookie ensured")
+            await self._ensure_session(ctx)
 
-            print(f"[DEBUG] render_url: Navigating to {url}")
+            logger.info("Navigating to dashboard URL")
             await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
-            print(f"[DEBUG] render_url: Page loaded (domcontentloaded)")
             network_timeout = self.settings.network_idle_timeout_ms if self.settings.pdf_fast_mode else 60_000
             if network_timeout > 0:
                 try:
                     await page.wait_for_load_state("networkidle", timeout=network_timeout)
-                    print(f"[DEBUG] render_url: Network idle (timeout={network_timeout}ms)")
                 except Exception:
-                    print(f"[DEBUG] render_url: Network idle not reached within {network_timeout}ms, continuing")
+                    logger.debug("Network idle not reached within %sms, continuing", network_timeout)
+
             if self.settings.wait_before_ready_ms > 0:
-                print(f"[DEBUG] render_url: Waiting {self.settings.wait_before_ready_ms}ms before panel checks")
                 await page.wait_for_timeout(self.settings.wait_before_ready_ms)
 
             if await page.locator('input[name="user"], form[action="/login"]').count() > 0:
                 await self._handle_login(page, url)
 
-            await self._wait_for_queries_complete(page, url)
+            dashboard_json = await self._fetch_dashboard_json(page, url=url)
+            await self._wait_for_queries_complete(page, url, dashboard_json)
 
-            print(f"[DEBUG] render_url: Injecting styles and banner")
+            await self._wait_for_dashboard_grid(page)
+
             await self._inject_styles(page)
             await self._inject_banner(page, header_title, header_period, header_generated)
-            await page.emulate_media(media="print")
-            print(f"[DEBUG] render_url: Styles and banner injected")
 
-            print(f"[DEBUG] render_url: Waiting for panels to be ready")
+            media = self.settings.pdf_media if self.settings.pdf_media in {"screen", "print"} else "screen"
+            await page.emulate_media(media=media)
+
+            # Measure real dashboard height and expand viewport so all panels paint
+            measured = await self._measure_height(page, dashboard_json)
+            target_height = min(
+                max(measured["totalHeight"], self.settings.viewport_height),
+                self.settings.pdf_max_viewport_height,
+            )
+            logger.info(
+                "Dashboard height measured via %s: content=%s total=%s -> viewport height=%s",
+                measured.get("source"),
+                measured.get("contentHeight"),
+                measured.get("totalHeight"),
+                target_height,
+            )
+            await page.set_viewport_size({"width": width, "height": target_height})
+            await page.wait_for_timeout(500)
+
             ready = await self._wait_for_panels_ready(page)
             if not ready:
-                print("[WARN] Panels not fully ready by timeout, proceeding anyway (best effort).")
-            else:
-                print(f"[DEBUG] render_url: All panels ready")
+                logger.warning("Panels not fully ready by timeout, proceeding anyway (best effort)")
 
-            extra_wait = 3000 if self.settings.pdf_fast_mode else self.settings.wait_extra_ms
-            print(f"[DEBUG] render_url: Extra wait of {extra_wait}ms")
-            await page.wait_for_timeout(extra_wait)
+            extra_wait = 1000 if self.settings.pdf_fast_mode else self.settings.wait_extra_ms
+            if extra_wait > 0:
+                await page.wait_for_timeout(extra_wait)
 
-            print(f"[DEBUG] render_url: Scrolling and trimming page")
-            await self._gentle_scroll(page)
-            await self._trim_page_height(page)
-            print(f"[DEBUG] render_url: Page prepared")
+            # Re-measure after resize/ready
+            measured = await self._measure_height(page, dashboard_json)
+            logger.info(
+                "Dashboard height re-measured via %s: content=%s total=%s",
+                measured.get("source"),
+                measured.get("contentHeight"),
+                measured.get("totalHeight"),
+            )
 
             if self.settings.debug_screenshot and not page.is_closed():
-                print(f"[DEBUG] render_url: Taking debug screenshot")
                 await page.screenshot(path=str(output_pdf.with_suffix(".png")), full_page=False)
 
-            print(f"[DEBUG] render_url: Generating PDF with mode={self.settings.pdf_size_mode}")
-            if self.settings.pdf_size_mode == "a4":
+            await page.evaluate(
+                """(title) => { document.title = title || document.title; }""",
+                header_title,
+            )
+
+            logger.info("Generating PDF with mode=%s", size_mode)
+            if size_mode == "a4":
                 await page.pdf(
                     path=str(output_pdf),
                     format=self.settings.pdf_paper_format,
@@ -121,7 +182,7 @@ class GrafanaPDFRenderer:
                     display_header_footer=False,
                     prefer_css_page_size=False,
                 )
-            elif self.settings.pdf_size_mode == "css":
+            elif size_mode == "css":
                 await page.pdf(
                     path=str(output_pdf),
                     landscape=self.settings.pdf_landscape,
@@ -130,40 +191,135 @@ class GrafanaPDFRenderer:
                     display_header_footer=False,
                     prefer_css_page_size=True,
                 )
+            elif size_mode == "paged":
+                await self._render_paged_pdf(page, output_pdf, width, page_height_px, measured)
             else:
-                width_in, height_in = await self._compute_pdf_dimensions(page)
-                await page.pdf(
-                    path=str(output_pdf),
-                    width=f"{width_in}in",
-                    height=f"{height_in}in",
-                    landscape=False,
-                    print_background=True,
-                    margin={"top": "0mm", "bottom": "0mm", "left": "0mm", "right": "0mm"},
-                    display_header_footer=False,
-                    prefer_css_page_size=False,
-                    page_ranges="1",
-                )
-            print(f"[DEBUG] render_url: PDF generated at {output_pdf}")
+                # auto: single page sized to content, fall back to paged if too tall
+                width_in, height_in = await self._compute_pdf_dimensions(page, measured, width=width)
+                if height_in > self.settings.pdf_max_inch or width_in > self.settings.pdf_max_inch:
+                    logger.warning(
+                        "auto mode exceeds PDF_MAX_INCH (%.1f x %.1f); falling back to paged",
+                        width_in,
+                        height_in,
+                    )
+                    await self._render_paged_pdf(page, output_pdf, width, page_height_px, measured)
+                else:
+                    await self._safe_eval(
+                        page,
+                        PREPARE_PRINT_JS,
+                        arg=int(measured.get("totalHeight") or 0),
+                        default=0,
+                    )
+                    await page.pdf(
+                        path=str(output_pdf),
+                        width=f"{width_in}in",
+                        height=f"{height_in}in",
+                        landscape=False,
+                        print_background=True,
+                        margin={"top": "0mm", "bottom": "0mm", "left": "0mm", "right": "0mm"},
+                        display_header_footer=False,
+                        prefer_css_page_size=False,
+                        page_ranges="1",
+                    )
 
-            print(f"[DEBUG] render_url: Closing browser context and browser")
-            await ctx.close()
-            await browser.close()
-            print(f"[DEBUG] render_url: Browser cleanup complete")
-
-    async def _route_filter(self, route, request):
-        try:
-            rtype = request.resource_type
-            url = request.url
-            if rtype in ("font", "media", "websocket", "eventsource"):
-                return await route.abort()
-            if url.endswith((".woff", ".woff2", ".ttf")):
-                return await route.abort()
-            return await route.continue_()
-        except Exception:
+            # Cache auth cookies for subsequent renders
             try:
-                await route.abort()
+                self._storage_state = await ctx.storage_state()
             except Exception:
-                pass
+                logger.debug("Could not persist storage_state", exc_info=True)
+
+            logger.info("PDF generated at %s", output_pdf)
+        finally:
+            if ctx is not None:
+                try:
+                    await ctx.close()
+                except Exception:
+                    logger.debug("Error closing browser context", exc_info=True)
+
+    async def _render_paged_pdf(
+        self,
+        page,
+        output_pdf: Path,
+        width: int,
+        page_height_px: int,
+        measured: dict,
+    ) -> None:
+        banner_h = int(measured.get("bannerHeight") or 0)
+        result = await self._safe_eval(
+            page,
+            PAGINATE_JS,
+            arg={"pageHeight": page_height_px, "bannerOffset": banner_h},
+            default={"ok": False, "reason": "eval-failed"},
+        )
+        if not result.get("ok"):
+            logger.warning("Pagination JS failed (%s); using single-page auto sizing", result.get("reason"))
+            width_in, height_in = await self._compute_pdf_dimensions(page, measured, width=width)
+            await self._safe_eval(page, PREPARE_PRINT_JS, arg=int(measured.get("totalHeight") or 0), default=0)
+            await page.pdf(
+                path=str(output_pdf),
+                width=f"{width_in}in",
+                height=f"{min(height_in, self.settings.pdf_max_inch)}in",
+                landscape=False,
+                print_background=True,
+                margin={"top": "0mm", "bottom": "0mm", "left": "0mm", "right": "0mm"},
+                display_header_footer=False,
+                prefer_css_page_size=False,
+            )
+            return
+
+        if result.get("tallPanels"):
+            logger.warning(
+                "%s panel(s) taller than page height (%spx); they may be split across pages",
+                result["tallPanels"],
+                page_height_px,
+            )
+
+        final_h = int(result.get("finalHeight") or page_height_px)
+        logger.info(
+            "Paged layout: %s page(s), page=%sx%spx, final_height=%s",
+            result.get("pageCount"),
+            width,
+            page_height_px,
+            final_h,
+        )
+        await page.pdf(
+            path=str(output_pdf),
+            width=f"{width}px",
+            height=f"{page_height_px}px",
+            landscape=False,
+            print_background=True,
+            margin={"top": "0mm", "bottom": "0mm", "left": "0mm", "right": "0mm"},
+            display_header_footer=False,
+            prefer_css_page_size=False,
+        )
+
+    def _make_route_handler(self):
+        grafana_host = urlparse(self.settings.grafana_url).hostname
+        token = self.settings.grafana_token
+        fast = self.settings.pdf_fast_mode
+
+        async def _handler(route, request):
+            try:
+                if fast:
+                    rtype = request.resource_type
+                    url = request.url
+                    if rtype in ("font", "media", "websocket", "eventsource"):
+                        return await route.abort()
+                    if url.endswith((".woff", ".woff2", ".ttf")):
+                        return await route.abort()
+                if token:
+                    host = urlparse(request.url).hostname
+                    if host == grafana_host:
+                        headers = {**request.headers, "Authorization": f"Bearer {token}"}
+                        return await route.continue_(headers=headers)
+                return await route.continue_()
+            except Exception:
+                try:
+                    await route.abort()
+                except Exception:
+                    pass
+
+        return _handler
 
     def _log_request_failure(self, req):
         try:
@@ -171,11 +327,21 @@ class GrafanaPDFRenderer:
                 return
             failure = getattr(req, "failure", None)
             reason = failure if isinstance(failure, str) else (getattr(failure, "error_text", None) or "request failed")
-            print(f"[REQ FAILED] {reason} -> {req.url}")
+            logger.debug("REQ FAILED %s -> %s", reason, req.url)
         except Exception as exc:
-            print(f"[REQ FAILED] (handler error: {exc})")
+            logger.debug("REQ FAILED handler error: %s", exc)
 
-    async def _ensure_session_cookie(self, ctx):
+    async def _ensure_session(self, ctx: BrowserContext) -> None:
+        if self.settings.grafana_token:
+            # Token auth is injected via route; still warm the session.
+            try:
+                check = await ctx.request.get(f"{self.settings.grafana_url}/api/user", timeout=30_000)
+                if check.status == 200:
+                    return
+            except Exception:
+                logger.debug("Token session check failed", exc_info=True)
+            return
+
         if not self.settings.grafana_user or not self.settings.grafana_password:
             return
 
@@ -190,7 +356,10 @@ class GrafanaPDFRenderer:
             resp = await ctx.request.post(
                 f"{self.settings.grafana_url}/login",
                 headers={"Content-Type": "application/json"},
-                data=f'{{"user":"{self.settings.grafana_user}","password":"{self.settings.grafana_password}"}}',
+                data={
+                    "user": self.settings.grafana_user,
+                    "password": self.settings.grafana_password,
+                },
                 timeout=60_000,
             )
             if resp.status == 200:
@@ -198,10 +367,10 @@ class GrafanaPDFRenderer:
                 if ok.status == 200:
                     return
             else:
-                txt = await resp.text()
-                print(f"[WARN] JSON login returned HTTP {resp.status}: {txt}")
+                txt = (await resp.text())[:200]
+                logger.warning("JSON login returned HTTP %s: %s", resp.status, txt)
         except Exception as exc:
-            print(f"[WARN] JSON login failed: {exc}")
+            logger.warning("JSON login failed: %s", exc)
 
         try:
             page = await ctx.new_page()
@@ -213,11 +382,13 @@ class GrafanaPDFRenderer:
                 await page.wait_for_url(lambda url: "/login" not in url, timeout=120_000)
             await page.close()
         except PWTimeoutError:
-            print("[WARN] Interactive login timeout (maybe SSO). Continuing…")
+            logger.warning("Interactive login timeout (maybe SSO). Continuing…")
         except Exception as exc:
-            print(f"[WARN] Interactive login failed: {exc}. Continuing…")
+            logger.warning("Interactive login failed: %s. Continuing…", exc)
 
     async def _handle_login(self, page, url: str) -> None:
+        if self.settings.grafana_token:
+            return
         if not (self.settings.grafana_user and self.settings.grafana_password):
             return
         await page.fill('input[name="user"]', self.settings.grafana_user)
@@ -231,19 +402,38 @@ class GrafanaPDFRenderer:
             except Exception:
                 pass
 
-    async def _safe_eval(self, page, script: str, default=None):
+    async def _safe_eval(self, page, script: str, default=None, arg=None):
         try:
             if page.is_closed():
                 return default
-            return await page.evaluate(script)
+            if arg is None:
+                return await page.evaluate(script)
+            return await page.evaluate(script, arg)
         except Exception:
             return default
 
-    async def _get_expected_query_count(self, page) -> int | None:
-        """Get expected number of data queries from dashboard JSON (from browser performance entries)."""
+    async def _wait_for_dashboard_grid(self, page, timeout_ms: int = 60_000) -> None:
+        """Wait until Grafana has mounted at least one panel grid item."""
+        try:
+            await page.wait_for_selector(".react-grid-item", timeout=timeout_ms, state="attached")
+        except Exception:
+            logger.warning("Dashboard grid items not found within %sms", timeout_ms)
+
+    @staticmethod
+    def _dashboard_uid_from_url(url: str) -> str | None:
+        try:
+            path = urlparse(url).path or ""
+        except Exception:
+            return None
+        # /d/<uid>/... or /d/<uid>
+        parts = [p for p in path.split("/") if p]
+        if len(parts) >= 2 and parts[0] == "d":
+            return parts[1]
+        return None
+
+    async def _fetch_dashboard_json(self, page, url: str | None = None) -> dict[str, Any] | None:
         script = """
         (async () => {
-          const excludedTypes = ['text'];
           const entry = performance.getEntriesByType("resource").find(r => {
             if (!['fetch','xmlhttprequest'].includes(r.initiatorType)) return false;
             const u = r.name;
@@ -254,79 +444,146 @@ class GrafanaPDFRenderer:
           try {
             const res = await fetch(entry.name, { credentials: 'include' });
             if (!res.ok) return null;
-            const json = await res.json();
-            const root = json?.spec ?? json?.model ?? json?.dashboard ?? json;
-            const panels = Array.isArray(root?.panels) ? root.panels : [];
-            const templating = root?.templating?.list ?? [];
-            function countPanels(list) {
-              let n = 0;
-              for (const p of list) {
-                if (!p || excludedTypes.includes(p.type)) continue;
-                if (p.type === 'row' && Array.isArray(p.panels)) { n += countPanels(p.panels); continue; }
-                const hasDs = !!p.datasource || (Array.isArray(p.targets) && p.targets.some(t => t?.datasource));
-                if (hasDs) n++;
-              }
-              return n;
-            }
-            const valid = countPanels(panels);
-            const templatingQueries = templating.filter(v => v?.type === 'query').length;
-            return valid + templatingQueries;
+            return await res.json();
           } catch (e) {
             return null;
           }
         })()
         """
         result = await self._safe_eval(page, script, default=None)
-        if result is None:
+        if isinstance(result, dict):
+            return result
+
+        # Fallback: fetch by UID via Grafana HTTP API (more reliable than performance entries).
+        uid = self._dashboard_uid_from_url(url or getattr(page, "url", "") or "")
+        if not uid:
             return None
-        return int(result) if isinstance(result, (int, float)) else None
+        api_url = f"{self.settings.grafana_url.rstrip('/')}/api/dashboards/uid/{uid}"
+        try:
+            ctx = page.context
+            resp = await ctx.request.get(api_url, timeout=30_000)
+            if resp.status == 200:
+                data = await resp.json()
+                return data if isinstance(data, dict) else None
+            logger.debug("Dashboard API fallback HTTP %s for %s", resp.status, uid)
+        except Exception:
+            logger.debug("Dashboard API fallback failed for %s", uid, exc_info=True)
+        return None
+
+    def _panels_from_dashboard_json(self, dashboard_json: dict | None) -> list:
+        if not dashboard_json:
+            return []
+        root = (
+            dashboard_json.get("spec")
+            or dashboard_json.get("model")
+            or dashboard_json.get("dashboard")
+            or dashboard_json
+        )
+        panels = root.get("panels") if isinstance(root, dict) else None
+        return panels if isinstance(panels, list) else []
+
+    async def _measure_height(self, page, dashboard_json: dict | None) -> dict:
+        measured = await self._safe_eval(page, MEASURE_HEIGHT_JS, default=None)
+        panels = self._panels_from_dashboard_json(dashboard_json)
+        estimated = height_from_grid_positions(panels)
+
+        if isinstance(measured, dict) and measured.get("contentHeight"):
+            # Prefer the larger of DOM measure vs gridPos estimate (DOM can still
+            # under-count briefly while nested row layouts finish mounting).
+            if estimated > 0 and int(measured.get("contentHeight") or 0) < int(estimated * 0.7):
+                banner = int(measured.get("bannerHeight") or 60)
+                offset = int(measured.get("offsetTop") or banner)
+                logger.info(
+                    "DOM height %s looks short vs gridPos estimate %s; using gridPos",
+                    measured.get("contentHeight"),
+                    estimated,
+                )
+                return {
+                    "source": "gridPos",
+                    "contentHeight": estimated,
+                    "bannerHeight": banner,
+                    "totalHeight": estimated + offset + 8,
+                    "offsetTop": offset,
+                }
+            return measured
+
+        if estimated > 0:
+            banner = 60
+            return {
+                "source": "gridPos",
+                "contentHeight": estimated,
+                "bannerHeight": banner,
+                "totalHeight": estimated + banner + 8,
+                "offsetTop": banner,
+            }
+
+        return {
+            "source": "viewport",
+            "contentHeight": self.settings.viewport_height,
+            "bannerHeight": 0,
+            "totalHeight": self.settings.viewport_height,
+            "offsetTop": 0,
+        }
+
+    async def _get_expected_query_count(self, page, dashboard_json: dict | None = None) -> int | None:
+        if dashboard_json is None:
+            dashboard_json = await self._fetch_dashboard_json(page)
+        if not dashboard_json:
+            return None
+        root = (
+            dashboard_json.get("spec")
+            or dashboard_json.get("model")
+            or dashboard_json.get("dashboard")
+            or dashboard_json
+        )
+        if not isinstance(root, dict):
+            return None
+        panels = root.get("panels") if isinstance(root.get("panels"), list) else []
+        templating = (root.get("templating") or {}).get("list") or []
+        excluded = {"text"}
+
+        def count_panels(lst: list) -> int:
+            n = 0
+            for p in lst:
+                if not isinstance(p, dict) or p.get("type") in excluded:
+                    continue
+                if p.get("type") == "row" and isinstance(p.get("panels"), list):
+                    n += count_panels(p["panels"])
+                    continue
+                has_ds = bool(p.get("datasource")) or any(
+                    isinstance(t, dict) and t.get("datasource") for t in (p.get("targets") or [])
+                )
+                if has_ds:
+                    n += 1
+            return n
+
+        valid = count_panels(panels)
+        templating_queries = sum(1 for v in templating if isinstance(v, dict) and v.get("type") == "query")
+        return valid + templating_queries
 
     async def _get_completed_query_count(self, page) -> int:
-        """Count completed Grafana query requests in the page's performance entries."""
         script = """
         () => performance.getEntriesByType("resource")
-          .filter(r => r.initiatorType === 'fetch' && r.name.includes('query')).length
+          .filter(r => r.initiatorType === 'fetch' && (
+            r.name.includes('/api/ds/query') || r.name.includes('/api/ds/query?')
+          )).length
         """
         val = await self._safe_eval(page, script, default=0)
         return int(val or 0)
 
-    async def _wait_for_queries_complete(self, page, url: str) -> None:
-        """
-        Wait for Grafana data queries to complete by polling performance entries.
-        Skips when CHECK_QUERIES_TO_COMPLETE is off or URL is single-panel (viewPanel=).
-        """
+    async def _wait_for_queries_complete(self, page, url: str, dashboard_json: dict | None = None) -> None:
         if not self.settings.check_queries_to_complete:
             return
         if "viewPanel=" in url:
-            print("[DEBUG] render_url: Skipping query wait (single-panel view)")
+            logger.debug("Skipping query wait (single-panel view)")
             return
-        print("[DEBUG] render_url: Waiting for all queries to complete (CHECK_QUERIES_TO_COMPLETE)")
-        # Scroll to trigger lazy-loaded panels
-        await self._safe_eval(
-            page,
-            """
-            (async () => {
-              const sel = '.scroll-canvas, [data-testid="scroll-container"], .dashboard-container';
-              const scrollableSection = document.querySelector(sel);
-              if (scrollableSection) {
-                const totalHeight = scrollableSection.scrollHeight;
-                const viewportHeight = window.innerHeight;
-                let scrolled = 0;
-                while (scrolled < totalHeight) {
-                  scrollableSection.scrollBy(0, viewportHeight);
-                  scrolled += viewportHeight;
-                  await new Promise(r => setTimeout(r, 500));
-                }
-              }
-            })()
-            """,
-        )
+        logger.debug("Waiting for all queries to complete")
+        await self._scroll_through(page)
         await page.wait_for_timeout(500)
-        expected = await self._get_expected_query_count(page)
+        expected = await self._get_expected_query_count(page, dashboard_json)
         if expected is None or expected == 0:
-            print("[DEBUG] render_url: Could not get expected query count, skipping query wait")
+            logger.debug("Could not get expected query count, skipping query wait")
             return
-        # Optional: subtract panels with errors so we don't wait forever for failed panels
         panel_error_count = await self._safe_eval(
             page,
             """
@@ -343,10 +600,8 @@ class GrafanaPDFRenderer:
             """,
             default=0,
         )
-        panel_error_count = int(panel_error_count or 0)
-        effective_expected = max(0, expected - panel_error_count)
+        effective_expected = max(0, int(expected) - int(panel_error_count or 0))
         if effective_expected == 0:
-            print("[DEBUG] render_url: No effective queries to wait for")
             return
         timeout_ms = self.settings.check_queries_completion_timeout_ms
         stuck_ms = self.settings.check_queries_stuck_threshold_ms
@@ -357,64 +612,106 @@ class GrafanaPDFRenderer:
         while elapsed < timeout_ms and not page.is_closed():
             completed = await self._get_completed_query_count(page)
             if completed >= effective_expected:
-                print(f"[DEBUG] render_url: All queries complete ({completed}/{effective_expected})")
+                logger.debug("All queries complete (%s/%s)", completed, effective_expected)
                 return
             if completed == last_count:
                 stuck_since += interval_ms
                 if stuck_since >= stuck_ms:
-                    print(f"[WARN] Query count unchanged at {completed}/{effective_expected} for {stuck_ms}ms, proceeding")
+                    logger.warning(
+                        "Query count unchanged at %s/%s for %sms, proceeding",
+                        completed,
+                        effective_expected,
+                        stuck_ms,
+                    )
                     return
             else:
                 stuck_since = 0
             last_count = completed
             await page.wait_for_timeout(interval_ms)
             elapsed += interval_ms
-            if elapsed % 10000 < interval_ms:
-                print(f"[DEBUG] render_url: Queries {completed}/{effective_expected}, elapsed {elapsed}ms")
-        print(f"[WARN] Query wait timed out after {timeout_ms}ms (last: {last_count}/{effective_expected}), proceeding")
-
-    async def _compute_pdf_dimensions(self, page) -> tuple[float, float]:
-        vals = await self._safe_eval(
-            page,
-            """
-            () => {
-              const doc = document.documentElement;
-              const body = document.body || {};
-              const widthCandidates = [
-                doc.scrollWidth,
-                doc.offsetWidth,
-                body.scrollWidth || 0,
-                body.offsetWidth || 0
-              ].filter(Boolean);
-
-              const heightCandidates = [
-                doc.scrollHeight,
-                doc.offsetHeight,
-                body.scrollHeight || 0,
-                body.offsetHeight || 0
-              ].filter(Boolean);
-
-              let maxBottom = 0;
-              const nodes = document.body ? document.body.querySelectorAll('*') : [];
-              nodes.forEach(el => {
-                const rect = el.getBoundingClientRect();
-                const bottom = rect.bottom + window.scrollY;
-                if (Number.isFinite(bottom) && bottom > maxBottom) {
-                  maxBottom = bottom;
-                }
-              });
-
-              const widthPx = Math.max(...(widthCandidates.length ? widthCandidates : [0]));
-              const heightPx = Math.max(maxBottom, ...(heightCandidates.length ? heightCandidates : [0]));
-              return [Math.ceil(widthPx), Math.ceil(heightPx)];
-            }
-            """,
-            default=[self.settings.viewport_width, self.settings.viewport_height],
+        logger.warning(
+            "Query wait timed out after %sms (last: %s/%s), proceeding",
+            timeout_ms,
+            last_count,
+            effective_expected,
         )
-        scroll_w, scroll_h = vals
-        width_in = min(max(1.0, scroll_w / self.settings.pdf_css_px_per_in), self.settings.pdf_max_inch)
-        height_in = min(max(1.0, (scroll_h + 5) / self.settings.pdf_css_px_per_in), self.settings.pdf_max_inch)
+
+    async def _compute_pdf_dimensions(
+        self,
+        page,
+        measured: dict | None = None,
+        width: int | None = None,
+    ) -> tuple[float, float]:
+        """Return PDF width/height in inches.
+
+        Values are intentionally *not* capped to ``pdf_max_inch`` so callers can
+        detect overflow and fall back to paged mode. Cap only when writing PDF.
+        """
+        if measured and measured.get("totalHeight"):
+            scroll_w = width or self.settings.viewport_width
+            scroll_h = int(measured["totalHeight"])
+        else:
+            vals = await self._safe_eval(
+                page,
+                """
+                () => {
+                  const doc = document.documentElement;
+                  const body = document.body || {};
+                  const scrollY = window.scrollY || window.pageYOffset || 0;
+                  let maxBottom = 0;
+                  document.querySelectorAll('.react-grid-item').forEach(el => {
+                    const r = el.getBoundingClientRect();
+                    const bottom = r.top + scrollY + r.height;
+                    if (bottom > maxBottom) maxBottom = bottom;
+                  });
+                  const widthPx = Math.max(
+                    doc.scrollWidth || 0,
+                    body.scrollWidth || 0,
+                    window.innerWidth || 0
+                  );
+                  const heightPx = Math.max(
+                    doc.scrollHeight || 0,
+                    body.scrollHeight || 0,
+                    maxBottom
+                  );
+                  return [Math.ceil(widthPx), Math.ceil(heightPx)];
+                }
+                """,
+                default=[width or self.settings.viewport_width, self.settings.viewport_height],
+            )
+            scroll_w, scroll_h = vals
+        # Small padding so page_ranges="1" does not clip the last panel edge.
+        pad_px = 48
+        width_in = max(1.0, scroll_w / self.settings.pdf_css_px_per_in)
+        height_in = max(1.0, (scroll_h + pad_px) / self.settings.pdf_css_px_per_in)
         return width_in, height_in
+
+
+    async def _scroll_through(self, page) -> None:
+        try:
+            await self._safe_eval(
+                page,
+                """
+                (async () => {
+                  const sel = '.scroll-canvas, [data-testid="scroll-container"], .dashboard-container, .scrollbar-view';
+                  const scrollableSection = document.querySelector(sel);
+                  const target = scrollableSection || document.scrollingElement || document.documentElement;
+                  const totalHeight = target.scrollHeight || document.documentElement.scrollHeight;
+                  const viewportHeight = window.innerHeight;
+                  let scrolled = 0;
+                  while (scrolled < totalHeight) {
+                    if (scrollableSection) scrollableSection.scrollBy(0, viewportHeight);
+                    else window.scrollBy(0, viewportHeight);
+                    scrolled += viewportHeight;
+                    await new Promise(r => setTimeout(r, 120));
+                  }
+                  if (scrollableSection) scrollableSection.scrollTo(0, 0);
+                  else window.scrollTo(0, 0);
+                })()
+                """,
+            )
+        except Exception:
+            pass
 
     async def _wait_for_panels_ready(self, page, timeout_ms: int | None = None) -> bool:
         timeout_ms = timeout_ms or self.settings.ready_timeout_ms
@@ -428,7 +725,6 @@ class GrafanaPDFRenderer:
             "div[aria-label='Panel'], "
             ".panel-container, .react-grid-item"
         )
-        panel_root_sel = "".join(panel_root_sel)
         panel_content_sel = "canvas, svg, table, img, .table-panel, [data-testid='table']"
 
         async def expected_panels() -> int:
@@ -491,34 +787,18 @@ class GrafanaPDFRenderer:
                 default=True,
             )
 
-        async def gentle_scroll_if_needed():
-            total = await self._safe_eval(page, "() => document.documentElement.scrollHeight", default=self.settings.viewport_height)
-            if total and total <= self.settings.viewport_height * 1.5:
-                return
-            step = 800
-            y = 0
-            while y < total and not page.is_closed():
-                await page.evaluate("(y) => window.scrollTo(0, y)", y)
-                await page.wait_for_timeout(120)
-                y += step
-            if not page.is_closed():
-                await page.evaluate("() => window.scrollTo(0, 0)")
-                await page.wait_for_timeout(120)
-
         exp = await expected_panels()
         if exp == 0:
             await page.wait_for_timeout(2000)
             return True
 
         if self.settings.pdf_fast_mode and exp <= 8:
-            for _ in range(75):  # up to ~15s (75 * 200ms) so slow panels can render
+            for _ in range(75):
                 if await no_spinners() and await tables_non_empty():
                     rd = await ready_panels()
                     if rd >= max(1, int(exp * 0.6)):
                         return True
                 await page.wait_for_timeout(200)
-        else:
-            await gentle_scroll_if_needed()
 
         consecutive_ready = 0
         last_ready_count = 0
@@ -542,80 +822,34 @@ class GrafanaPDFRenderer:
                     return True
 
             await page.wait_for_timeout(250)
-            if page.is_closed():
-                break
-            await page.evaluate("() => window.scrollBy(0, 300)")
 
         return False
 
-    async def _gentle_scroll(self, page) -> None:
-        try:
-            total = await self._safe_eval(page, "() => document.documentElement.scrollHeight", default=self.settings.viewport_height)
-            step = max(600, self.settings.viewport_height // 2)
-            y = 0
-            while y < min(total, self.settings.viewport_height * 4) and not page.is_closed():
-                await page.evaluate("(y) => window.scrollTo(0, y)", y)
-                await page.wait_for_timeout(120)
-                y += step
-            if not page.is_closed():
-                await page.evaluate("() => window.scrollTo(0, 0)")
-                await page.wait_for_timeout(120)
-        except Exception:
-            pass
-
-    async def _trim_page_height(self, page) -> None:
-        try:
-            await page.evaluate(
-                """
-                () => {
-                    const body = document.body;
-                    if (!body) return;
-                    const allElements = Array.from(document.querySelectorAll('*'));
-                    let maxBottom = 0;
-                    allElements.forEach(el => {
-                        const rect = el.getBoundingClientRect();
-                        const bottom = rect.top + rect.height;
-                        if (bottom > maxBottom) {
-                            maxBottom = bottom;
-                        }
-                    });
-                    if (maxBottom > 0) {
-                        body.style.height = Math.ceil(maxBottom + 20) + 'px';
-                        body.style.minHeight = body.style.height;
-                        body.style.maxHeight = body.style.height;
-                    }
-                }
-                """
-            )
-        except Exception as exc:
-            print(f"[WARN] Failed to trim page height: {exc}")
-
     async def _inject_styles(self, page) -> None:
         await page.add_style_tag(content=self._style_block())
-        # Remove any visible "PDF Export" buttons/links to keep the PDF clean
         try:
             await page.evaluate(
-                    """
-                    (() => {
-                        const isPdfExportLabel = (el) => {
-                            const txt = (el.textContent || '').toLowerCase();
-                            return txt.includes('pdf export');
-                        };
-                        const selectors = [
-                            'a[href*="/pdf-export"]',
-                            'button[href*="/pdf-export"]',
-                        ];
-                        selectors.forEach(sel => {
-                            document.querySelectorAll(sel).forEach(el => el.remove());
-                        });
-                        document.querySelectorAll('a, button').forEach(el => {
-                            if (isPdfExportLabel(el)) el.remove();
-                        });
-                    })();
-                    """
+                """
+                (() => {
+                    const isPdfExportLabel = (el) => {
+                        const txt = (el.textContent || '').toLowerCase();
+                        return txt.includes('pdf export');
+                    };
+                    const selectors = [
+                        'a[href*="/pdf-export"]',
+                        'button[href*="/pdf-export"]',
+                    ];
+                    selectors.forEach(sel => {
+                        document.querySelectorAll(sel).forEach(el => el.remove());
+                    });
+                    document.querySelectorAll('a, button').forEach(el => {
+                        if (isPdfExportLabel(el)) el.remove();
+                    });
+                })();
+                """
             )
         except Exception:
-                pass
+            pass
 
     async def _inject_banner(self, page, title: str, period: str, generated: str) -> None:
         try:
@@ -632,15 +866,20 @@ class GrafanaPDFRenderer:
                                 body.appendChild(banner);
                             }
                         }
-                        banner.innerHTML = `
-                            <div class="rb-title">${title}</div>
-                            <div class="rb-meta">Period: ${period} • Generated: ${generated}</div>
-                        `;
+                        banner.replaceChildren();
+                        const titleEl = document.createElement('div');
+                        titleEl.className = 'rb-title';
+                        titleEl.textContent = title;
+                        const metaEl = document.createElement('div');
+                        metaEl.className = 'rb-meta';
+                        metaEl.textContent = 'Period: ' + period + ' • Generated: ' + generated;
+                        banner.appendChild(titleEl);
+                        banner.appendChild(metaEl);
                     }""",
                 {"title": title, "period": period, "generated": generated},
             )
         except Exception as exc:
-            print(f"[WARN] Failed to inject banner: {exc}")
+            logger.warning("Failed to inject banner: %s", exc)
 
         try:
             await page.evaluate(
@@ -660,14 +899,6 @@ class GrafanaPDFRenderer:
                             child.style.opacity = '1';
                         });
                     });
-                    const rowGroups = document.querySelectorAll('[role="rowgroup"]');
-                    rowGroups.forEach(group => {
-                        if (group.querySelector('[role="columnheader"]')) {
-                            group.style.display = 'block';
-                            group.style.visibility = 'visible';
-                            group.style.opacity = '1';
-                        }
-                    });
                     const separators = document.querySelectorAll('[role="separator"], [draggable="false"]');
                     separators.forEach(sep => {
                         if ((sep.getAttribute('role') === 'separator') ||
@@ -681,7 +912,7 @@ class GrafanaPDFRenderer:
                 """
             )
         except Exception as exc:
-            print(f"[WARN] Failed to force table headers visible: {exc}")
+            logger.warning("Failed to force table headers visible: %s", exc)
 
     def _style_block(self) -> str:
         return """
@@ -704,24 +935,24 @@ class GrafanaPDFRenderer:
               display: none !important;
             }
 
-                        /* Keep panel legends visible (Grafana legends use buttons) */
-                        [data-testid="viz-legend"], [data-testid="legend"], .viz-legend, .legend-container, .graph-legend, .panel-legend {
-                            display: flex !important;
-                            visibility: visible !important;
-                            opacity: 1 !important;
-                            height: auto !important;
-                        }
-                        [data-testid="viz-legend"] button,
-                        [data-testid="legend"] button,
-                        .legend-container button,
-                        .panel-legend button,
-                        .graph-legend button,
-                        [data-testid="legend-item"] button,
-                        [data-testid="viz-legend-item"] button {
-                            display: inline-flex !important;
-                            visibility: visible !important;
-                            opacity: 1 !important;
-                        }
+            /* Keep panel legends visible (Grafana legends use buttons) */
+            [data-testid="viz-legend"], [data-testid="legend"], .viz-legend, .legend-container, .graph-legend, .panel-legend {
+                display: flex !important;
+                visibility: visible !important;
+                opacity: 1 !important;
+                height: auto !important;
+            }
+            [data-testid="viz-legend"] button,
+            [data-testid="legend"] button,
+            .legend-container button,
+            .panel-legend button,
+            .graph-legend button,
+            [data-testid="legend-item"] button,
+            [data-testid="viz-legend-item"] button {
+                display: inline-flex !important;
+                visibility: visible !important;
+                opacity: 1 !important;
+            }
 
             .page, .page-content, .main-view, .dashboard-container {
               padding: 0 !important; margin: 0 !important;
@@ -729,12 +960,10 @@ class GrafanaPDFRenderer:
 
             * { animation: none !important; transition: none !important; }
             html, body {
-              background: #ffffff !important;
               overflow: visible !important;
               -webkit-print-color-adjust: exact !important;
               print-color-adjust: exact !important;
             }
-            /* Preserve Grafana threshold/conditional formatting colors in table cells (avoid green turning pink in PDF) */
             table td, table th, .table-panel td, .table-panel th,
             [data-testid="table"] td, [data-testid="table"] th,
             [role="cell"], [role="gridcell"],
@@ -750,6 +979,9 @@ class GrafanaPDFRenderer:
             .dashboard-container, .scrollbar-view {
               padding-bottom: 0 !important;
               margin-bottom: 0 !important;
+              overflow: visible !important;
+              height: auto !important;
+              max-height: none !important;
             }
 
             #report-banner {
@@ -766,7 +998,6 @@ class GrafanaPDFRenderer:
             table thead,
             table thead tr,
             table thead th,
-            table thead td,
             thead,
             .table-panel thead,
             [data-testid="table"] thead {
@@ -814,14 +1045,6 @@ class GrafanaPDFRenderer:
               overflow: visible !important;
             }
 
-            [role="columnheader"] button,
-            [role="columnheader"] svg,
-            [role="columnheader"] div {
-              visibility: visible !important;
-              opacity: 1 !important;
-              display: inline-flex !important;
-            }
-
             [role="columnheader"] [role="separator"],
             [role="columnheader"] [draggable],
             [role="separator"],
@@ -842,82 +1065,27 @@ class GrafanaPDFRenderer:
                 -webkit-print-color-adjust: exact !important;
                 print-color-adjust: exact !important;
               }
-              table td, table th, .table-panel td, .table-panel th,
-              [data-testid="table"] td, [data-testid="table"] th,
-              [role="cell"], [role="gridcell"],
-              [data-testid="table"] [role="row"] > div {
-                -webkit-print-color-adjust: exact !important;
-                print-color-adjust: exact !important;
-              }
               body {
                 padding: 0 !important;
                 margin: 0 !important;
               }
-              * {
-                break-before: avoid !important;
-              }
-              .dashboard-container, .react-grid-layout, .panel-container {
+              .react-grid-item, .panel-container, [data-testid="panel-container"] {
                 break-inside: avoid !important;
-              }
-
-                            /* Hide general UI controls but keep legends */
-                            .toolbar button,
-                            nav button,
-                            [data-testid="topnav"] button,
-                            [data-testid="page-actions"] button,
-                            [data-testid="page-header"] button,
-                            [data-testid="DashboardHeader"] button,
-                            [data-testid="RefreshPicker"] button,
-                            .gf-form button {
-                                display: none !important;
-                            }
-                            .toolbar, .gf-form {
-                                display: none !important;
-                            }
-
-              table thead,
-              thead,
-              .table-panel thead,
-              [data-testid="table"] thead {
-                display: table-header-group !important;
                 page-break-inside: avoid !important;
-                visibility: visible !important;
-              }
-              table thead tr,
-              table thead th,
-              table thead td,
-              th {
-                display: table-cell !important;
-                visibility: visible !important;
-                opacity: 1 !important;
               }
 
-              [role="rowgroup"]:has([role="columnheader"]) {
-                display: block !important;
-                visibility: visible !important;
-                opacity: 1 !important;
-                page-break-inside: avoid !important;
-                overflow: visible !important;
+              .toolbar button,
+              nav button,
+              [data-testid="topnav"] button,
+              [data-testid="page-actions"] button,
+              [data-testid="page-header"] button,
+              [data-testid="DashboardHeader"] button,
+              [data-testid="RefreshPicker"] button,
+              .gf-form button {
+                  display: none !important;
               }
-
-              [role="row"][aria-label="table header"] {
-                display: flex !important;
-                visibility: visible !important;
-                opacity: 1 !important;
-                page-break-inside: avoid !important;
-                min-height: 35px !important;
-                position: relative !important;
-                overflow: visible !important;
-              }
-
-              [role="columnheader"],
-              div[role="columnheader"] {
-                display: flex !important;
-                visibility: visible !important;
-                opacity: 1 !important;
-                page-break-inside: avoid !important;
-                position: absolute !important;
-                overflow: visible !important;
+              .toolbar, .gf-form {
+                  display: none !important;
               }
             }
         """

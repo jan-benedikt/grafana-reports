@@ -9,7 +9,7 @@ data:
 
     reports:
       - name: "Report with plaintext email body"
-        dashboard_uid: "<dashboard_uid>"
+        dashboard_uid: "example-dashboard-uid"
         vars:
           team: "windows"
           env: "prd"
@@ -26,7 +26,7 @@ data:
           filename_prefix: "<name_of_the_report>"
 
       - name: "Report with rich HTML email body"
-        dashboard_uid: "<dashboard_uid>"
+        dashboard_uid: "example-dashboard-uid"
         #vars:
         #  team: "windows"
         #  env: "prd"

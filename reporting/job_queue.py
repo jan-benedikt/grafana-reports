@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-import time
-from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+import logging
+from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+class QueueFullError(RuntimeError):
+    """Raised when the pending queue exceeds max_pending."""
 
 
 @dataclass
@@ -33,18 +40,15 @@ class JobQueue:
     result (or raises) once the job finishes, so callers can ``await`` it.
     """
 
-    def __init__(self, concurrency: int = 2) -> None:
+    def __init__(self, concurrency: int = 2, max_pending: int = 10) -> None:
         self._concurrency = max(1, concurrency)
+        self._max_pending = max(1, max_pending)
         self._queue: asyncio.Queue[_Job] = asyncio.Queue()
-        self._workers: List[asyncio.Task] = []
-        self._active: Dict[int, _ActiveJob] = {}
+        self._workers: list[asyncio.Task] = []
+        self._active: dict[int, _ActiveJob] = {}
         self._job_counter = 0
         self._total_completed = 0
         self._total_failed = 0
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
 
     async def start(self) -> None:
         if self._workers:
@@ -52,18 +56,14 @@ class JobQueue:
         for wid in range(self._concurrency):
             task = asyncio.create_task(self._worker(wid), name=f"queue-worker-{wid}")
             self._workers.append(task)
-        print(f"[QUEUE] Started {self._concurrency} worker(s)")
+        logger.info("Started %d worker(s), max_pending=%d", self._concurrency, self._max_pending)
 
     async def stop(self) -> None:
         for w in self._workers:
             w.cancel()
         await asyncio.gather(*self._workers, return_exceptions=True)
         self._workers.clear()
-        print("[QUEUE] All workers stopped")
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        logger.info("All workers stopped")
 
     async def submit(self, name: str, coro_factory: Callable[[], Awaitable[Any]]) -> Any:
         """Enqueue a job and wait for its result.
@@ -72,6 +72,12 @@ class JobQueue:
         execute (e.g. ``lambda: runner.generate_pdf(...)``).  This avoids
         creating the coroutine before a worker is ready.
         """
+        pending = self._queue.qsize()
+        if pending >= self._max_pending:
+            raise QueueFullError(
+                f"Queue is full ({pending}/{self._max_pending} pending). Try again later."
+            )
+
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
         self._job_counter += 1
@@ -83,24 +89,27 @@ class JobQueue:
             enqueued_at=loop.time(),
         )
 
-        pending = self._queue.qsize()
         active = len(self._active)
         if pending > 0 or active >= self._concurrency:
-            print(
-                f"[QUEUE] '{name}' queued at position {pending + 1} "
-                f"(active: {active}/{self._concurrency})"
+            logger.info(
+                "'%s' queued at position %d (active: %d/%d)",
+                name,
+                pending + 1,
+                active,
+                self._concurrency,
             )
         else:
-            print(f"[QUEUE] '{name}' submitted (worker available)")
+            logger.info("'%s' submitted (worker available)", name)
 
         await self._queue.put(job)
         return await future
 
     def status(self) -> dict:
         """Snapshot of queue state, suitable for the ``/queue`` API."""
-        now = asyncio.get_event_loop().time()
+        now = asyncio.get_running_loop().time()
         return {
             "concurrency": self._concurrency,
+            "max_pending": self._max_pending,
             "pending": self._queue.qsize(),
             "active": [
                 {
@@ -115,19 +124,20 @@ class JobQueue:
             "total_failed": self._total_failed,
         }
 
-    # ------------------------------------------------------------------
-    # Workers
-    # ------------------------------------------------------------------
-
     async def _worker(self, worker_id: int) -> None:
         while True:
             job = await self._queue.get()
             loop = asyncio.get_running_loop()
             wait_s = loop.time() - job.enqueued_at
             if wait_s >= 0.5:
-                print(f"[QUEUE] Worker {worker_id} picked up '{job.name}' (waited {wait_s:.1f}s in queue)")
+                logger.info(
+                    "Worker %d picked up '%s' (waited %.1fs in queue)",
+                    worker_id,
+                    job.name,
+                    wait_s,
+                )
             else:
-                print(f"[QUEUE] Worker {worker_id} starting '{job.name}'")
+                logger.info("Worker %d starting '%s'", worker_id, job.name)
 
             active = _ActiveJob(id=job.id, name=job.name, worker_id=worker_id, started_at=loop.time())
             self._active[worker_id] = active
@@ -137,7 +147,7 @@ class JobQueue:
                     job.future.set_result(result)
                 self._total_completed += 1
                 elapsed = loop.time() - active.started_at
-                print(f"[QUEUE] Worker {worker_id} finished '{job.name}' ({elapsed:.1f}s)")
+                logger.info("Worker %d finished '%s' (%.1fs)", worker_id, job.name, elapsed)
             except asyncio.CancelledError:
                 if not job.future.done():
                     job.future.cancel()
@@ -146,7 +156,7 @@ class JobQueue:
                 if not job.future.done():
                     job.future.set_exception(exc)
                 self._total_failed += 1
-                print(f"[QUEUE] Worker {worker_id} failed '{job.name}': {exc}")
+                logger.exception("Worker %d failed '%s': %s", worker_id, job.name, exc)
             finally:
                 self._active.pop(worker_id, None)
                 self._queue.task_done()
