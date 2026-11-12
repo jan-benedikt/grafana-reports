@@ -2,13 +2,20 @@ timezone: "Europe/Prague"
 
 reports:
   - name: "Report with plaintext email body"
-    dashboard_uid: "<dashboard_uid>"
+    dashboard_uid: "example-dashboard-uid"
     vars:
       team: "windows"
       env: "prd"
     from: "now-30d"
     to: "now"
     cron: "0 7 1 * *"    # 07:00 on the 1st day of each month
+    # Optional per-report PDF overrides:
+    # render:
+    #   width: 1920
+    #   page_mode: paged   # auto | a4 | css | paged
+    #   page_height_px: 1358
+    #   theme: light
+    #   scale_factor: 2
     email:
       to: ["ops@example.com", "sre@example.com"]
       subject: "Report with plaintext email body – {{ period_from_human }} → {{ period_to_human }}"
@@ -19,7 +26,7 @@ reports:
       filename_prefix: "<name_of_the_report>"
 
   - name: "Report with rich HTML email body"
-    dashboard_uid: "<dashboard_uid>"
+    dashboard_uid: "example-dashboard-uid"
     #vars:
     #  team: "windows"
     #  env: "prd"

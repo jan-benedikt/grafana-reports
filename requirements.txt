@@ -1,9 +1,19 @@
-apscheduler>=3.10.4
-fastapi>=0.111.0
-jinja2>=3.1.4
-playwright>=1.45.0
-pyyaml>=6.0.2
-python-dateutil>=2.9.0
-requests>=2.32.3
-uvicorn[standard]>=0.30.0
-tzdata>=2025.2
+# Runtime (Docker base: Playwright v1.64.1-resolute → Python 3.14)
+apscheduler>=3.11.3,<4
+fastapi>=0.162.0,<1
+jinja2>=3.1.6,<4
+# Must match Dockerfile base image tag (mcr.microsoft.com/playwright/python)
+playwright==1.64.1
+pyyaml>=6.0.3,<7
+# 4.x requires Python >=3.11
+python-dateutil>=4.0.0,<5
+requests>=2.34.2,<3
+uvicorn[standard]>=0.54.0,<1
+tzdata>=2026.6
+
+# Tests / tooling
+pytest>=9.2.0,<10
+pytest-asyncio>=1.4.1,<2
+httpx>=0.28.1,<1
+# Preferred by starlette/fastapi TestClient (httpx alone is deprecated there)
+httpx2>=2.0.0,<3

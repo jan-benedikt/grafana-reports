@@ -13,9 +13,13 @@ spec:
       labels:
         app: grafana-reports
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
       containers:
         - name: grafana-reports
-          image: ghcr.io/jan-benedikt/grafana-reports:latest
+          image: ghcr.io/jan-benedikt/grafana-reports:v1.1.0
           imagePullPolicy: IfNotPresent
           args: ["--daemon", "--api-port", "8080"]
           envFrom:
@@ -24,10 +28,22 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           volumeMounts:
             - name: reports-config
               mountPath: /app/config.yml
               subPath: config.yml
+              readOnly: true
+            - name: pdf-tmp
+              mountPath: /tmp/pdfs
+            - name: tmp
+              mountPath: /tmp
+            - name: dshm
+              mountPath: /dev/shm
           livenessProbe:
             httpGet:
               path: /healthz
@@ -42,12 +58,20 @@ spec:
             periodSeconds: 15
           resources:
             requests:
-              cpu: 100m
-              memory: 256Mi
+              cpu: 250m
+              memory: 1Gi
             limits:
-              cpu: 500m
-              memory: 512Mi
+              cpu: "2"
+              memory: 2Gi
       volumes:
         - name: reports-config
           configMap:
             name: grafana-reports-config
+        - name: pdf-tmp
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
