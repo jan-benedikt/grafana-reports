@@ -46,6 +46,30 @@ def height_from_grid_positions(panels: Iterable[dict]) -> int:
     return max_bottom * (GRID_CELL_HEIGHT + GRID_CELL_VMARGIN) - GRID_CELL_VMARGIN
 
 
+def clamp_viewport_height(
+    desired_height: int,
+    *,
+    width: int,
+    scale: float,
+    max_height: int,
+    pixel_budget: int,
+    min_height: int = 720,
+) -> int:
+    """Clamp the expanded viewport height to hard and memory-budget limits.
+
+    ``pixel_budget`` bounds the rasterized surface in device pixels
+    (``width*scale * height*scale``); huge viewports at high device scale
+    factors were measured at ~1 GB Chromium RSS and can OOM the container.
+    A value <= 0 disables the budget.
+    """
+    height = min(desired_height, max_height)
+    if pixel_budget > 0 and width > 0 and scale > 0:
+        budget_height = int(pixel_budget / (width * scale * scale))
+        if height > budget_height:
+            height = max(min_height, budget_height)
+    return max(min_height, height)
+
+
 def compute_page_breaks(
     panels: Sequence[PanelRect],
     page_height: float,
@@ -368,5 +392,173 @@ PREPARE_PRINT_JS = """
     el.style.maxHeight = 'none';
   });
   return h;
+}
+"""
+
+# Grafana's default colored-background cell is a CSS linear-gradient, and
+# react-data-grid adds box-shadows plus translucent gauge and frozen-column
+# gradients. Chromium prints each of those as its own PDF shading or
+# soft-masked image, so Acrobat paints cells one by one and can hang.
+# Full-cell sheens become a single opaque fill (text stays vector). Tables
+# that still contain many bar gradients are left for the renderer to snapshot.
+OPTIMIZE_TABLES_FOR_PDF_JS = r"""
+() => {
+  const RASTER_MIN = 24;
+  const rootSel = '.rdg, table, [role="grid"], [role="table"]';
+  const all = Array.from(document.querySelectorAll(rootSel));
+  const roots = all.filter(el => !all.some(other => other !== el && other.contains(el)));
+  if (!roots.length) {
+    return { flattened: 0, opacityFixed: 0, rasterize: [] };
+  }
+
+  if (!document.getElementById('pdf-table-optimize')) {
+    const style = document.createElement('style');
+    style.id = 'pdf-table-optimize';
+    style.textContent = `
+      .rdg-frozen-column-shadow, [class*="frozen-column-shadow"] {
+        display: none !important;
+        background: none !important;
+      }
+      .rdg, .rdg *, table, table *, [role="grid"], [role="grid"] *, [role="table"], [role="table"] * {
+        box-shadow: none !important;
+        filter: none !important;
+        -webkit-filter: none !important;
+        backdrop-filter: none !important;
+        -webkit-backdrop-filter: none !important;
+        text-shadow: none !important;
+        mix-blend-mode: normal !important;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = 1;
+  canvas.height = 1;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) {
+    return { flattened: 0, opacityFixed: 0, rasterize: [], error: 'no-canvas' };
+  }
+
+  const COLOR_RE = /rgba?\([^)]+\)|hsla?\([^)]+\)|#[0-9a-fA-F]{3,8}|\btransparent\b/g;
+
+  function alphaOf(color) {
+    if (!color || color === 'transparent') return 0;
+    ctx.clearRect(0, 0, 1, 1);
+    ctx.globalCompositeOperation = 'copy';
+    ctx.fillStyle = '#000';
+    ctx.fillStyle = color;
+    ctx.fillRect(0, 0, 1, 1);
+    ctx.globalCompositeOperation = 'source-over';
+    return ctx.getImageData(0, 0, 1, 1).data[3];
+  }
+
+  function bake(color, under) {
+    ctx.clearRect(0, 0, 1, 1);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = under || '#ffffff';
+    ctx.fillRect(0, 0, 1, 1);
+    ctx.fillStyle = color;
+    ctx.fillRect(0, 0, 1, 1);
+    const d = ctx.getImageData(0, 0, 1, 1).data;
+    return 'rgb(' + d[0] + ', ' + d[1] + ', ' + d[2] + ')';
+  }
+
+  function opaqueUnder(el) {
+    let node = el.parentElement;
+    while (node) {
+      const bg = getComputedStyle(node).backgroundColor;
+      if (bg && bg !== 'transparent' && bg !== 'rgba(0, 0, 0, 0)') {
+        const a = alphaOf(bg);
+        if (a >= 250) return bg;
+        if (a > 0) return bake(bg, '#ffffff');
+      }
+      node = node.parentElement;
+    }
+    return '#ffffff';
+  }
+
+  // Full-cell sheen: linear-gradient(120deg, darker, color) with no stops.
+  // Bar gauges use percentage stops (color 40%, transparent 40%) and must
+  // not be flattened to a single color.
+  function classify(bgImage) {
+    if (!bgImage || bgImage === 'none' || !bgImage.includes('gradient')) return null;
+    const grads = bgImage.match(/[a-z-]*gradient\(/g) || [];
+    if (grads.length !== 1 || bgImage.includes('repeating-')) return 'complex';
+    if (!bgImage.startsWith('linear-gradient(')) return 'complex';
+    if (bgImage.includes('%')) return 'complex';
+    const colors = bgImage.match(COLOR_RE) || [];
+    if (colors.length < 2) return 'complex';
+    return { colors: colors };
+  }
+
+  let flattened = 0;
+  let opacityFixed = 0;
+  const rasterize = [];
+  let rasterSeq = 0;
+
+  roots.forEach(root => {
+    const nodes = [root, ...root.querySelectorAll('*')];
+    const sheens = [];
+    let complex = 0;
+    nodes.forEach(el => {
+      if (!(el instanceof HTMLElement)) return;
+      const cs = getComputedStyle(el);
+      const op = parseFloat(cs.opacity);
+      if (op > 0.02 && op < 0.999) {
+        el.style.setProperty('opacity', '1', 'important');
+        opacityFixed++;
+      }
+      const kind = classify(cs.backgroundImage);
+      if (kind === 'complex') {
+        complex++;
+        return;
+      }
+      if (kind && kind.colors) {
+        sheens.push({ el: el, colors: kind.colors });
+        return;
+      }
+      const bg = cs.backgroundColor;
+      if (bg && bg.startsWith('rgba')) {
+        const a = alphaOf(bg);
+        if (a > 8 && a < 250) {
+          sheens.push({ el: el, solid: bake(bg, opaqueUnder(el)) });
+        }
+      }
+    });
+
+    if (complex >= RASTER_MIN) {
+      const rect = root.getBoundingClientRect();
+      const id = String(rasterSeq++);
+      root.setAttribute('data-pdf-table-id', id);
+      rasterize.push({ id: id, complex: complex, width: rect.width, height: rect.height });
+      return;
+    }
+
+    sheens.forEach(item => {
+      const el = item.el;
+      if (item.solid) {
+        el.style.setProperty('background-image', 'none', 'important');
+        el.style.setProperty('background-color', item.solid, 'important');
+        flattened++;
+        return;
+      }
+      const last = item.colors[item.colors.length - 1];
+      const lastAlpha = alphaOf(last);
+      if (lastAlpha > 20) {
+        el.style.setProperty('background', bake(last, opaqueUnder(el)), 'important');
+      } else {
+        el.style.setProperty('background-image', 'none', 'important');
+        const label = (el.className && el.className.toString()) || '';
+        const text = (el.textContent || '').trim();
+        if (!text && (el.clientWidth <= 24 || el.clientHeight <= 24 || /shadow/i.test(label))) {
+          el.style.setProperty('display', 'none', 'important');
+        }
+      }
+      flattened++;
+    });
+  });
+
+  return { flattened: flattened, opacityFixed: opacityFixed, rasterize: rasterize };
 }
 """

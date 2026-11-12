@@ -19,7 +19,11 @@ COPY grafana_report.py ./
 COPY reporting ./reporting
 COPY config.yml ./config.yml
 
-RUN mkdir -p /tmp/pdfs \
+# tini reaps orphaned Chromium processes (Python runs as PID 1 otherwise)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /tmp/pdfs \
     && chown -R pwuser:pwuser /app /tmp/pdfs
 
 USER pwuser
@@ -27,5 +31,5 @@ USER pwuser
 EXPOSE 8080
 
 # Default command runs scheduler + FastAPI daemon. Override CMD for custom runs.
-ENTRYPOINT ["python", "grafana_report.py"]
+ENTRYPOINT ["/usr/bin/tini", "--", "python", "grafana_report.py"]
 CMD ["--daemon"]

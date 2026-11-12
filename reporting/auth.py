@@ -51,8 +51,10 @@ def verify_api_key(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    provided_bytes = provided.encode("utf-8")
     for candidate in configured:
-        if hmac.compare_digest(provided, candidate):
+        # Compare as bytes: str compare_digest raises TypeError on non-ASCII input
+        if hmac.compare_digest(provided_bytes, candidate.encode("utf-8")):
             return provided
 
     logger.warning("Rejected request with invalid API key")

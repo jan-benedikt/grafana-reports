@@ -4,6 +4,7 @@ Modular Playwright-based exporter that schedules Grafana dashboards, emails PDFs
 
 ## Features
 - **Accurate PDFs**: measures the real Grafana grid height, expands the viewport so all panels paint, and supports `paged` (breaks between panels), `auto`, `a4`, or `css` sizing.
+- **Fast-opening tables**: colored Grafana cells are written as solid fills instead of one gradient or shadow per cell, so Acrobat does not paint them in one by one. Disable with `PDF_SIMPLIFY_TABLES=0`.
 - **Secure API**: exports require an API key (`API_KEYS`); Grafana service-account tokens are supported.
 - **Flexible delivery**: SMTP (STARTTLS/SSL) or SendGrid, plaintext or branded HTML templates with inline images, per-report Jinja subjects/bodies.
 - **Multiple entry points**: CLI for scheduler / batch runs, FastAPI for API-triggered exports, shared Chromium process for efficiency.

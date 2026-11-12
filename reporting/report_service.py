@@ -105,39 +105,44 @@ class ReportRunner:
             render=render,
         )
 
-        ctx = {
-            "name": report.name,
-            "dashboard_uid": report.dashboard_uid,
-            "vars": report.vars,
-            "period_from": range_spec.start,
-            "period_to": range_spec.end,
-            "period_from_human": range_spec.start.strftime("%Y-%m-%d %H:%M"),
-            "period_to_human": range_spec.end.strftime("%Y-%m-%d %H:%M"),
-        }
-        body = _render_template(report.email.body, ctx, html=False)
-        body_html = (
-            _render_template(report.email.body_html, ctx, html=True) if report.email.body_html else None
-        )
-        email_ctx = {**ctx, "text_body": body, "html_body": body_html}
-
         if send_mail and self.settings.email_enabled and report.email.to:
-            subject = _render_template(report.email.subject, ctx, html=False)
-            logger.info("Sending email to %s subject=%s", report.email.to, subject)
-            await asyncio.to_thread(
-                self.mailer.send,
-                report.email.to,
-                subject,
-                body,
-                pdf_path,
-                context=email_ctx,
-                html_body=body_html,
-            )
-            # Scheduled/emailed PDFs would otherwise accumulate forever
+            # Templates are rendered only when an email is actually sent; the
+            # API download path must not depend on email configuration.
+            ctx = {
+                "name": report.name,
+                "dashboard_uid": report.dashboard_uid,
+                "vars": report.vars,
+                "period_from": range_spec.start,
+                "period_to": range_spec.end,
+                "period_from_human": range_spec.start.strftime("%Y-%m-%d %H:%M"),
+                "period_to_human": range_spec.end.strftime("%Y-%m-%d %H:%M"),
+            }
             try:
-                pdf_path.unlink(missing_ok=True)
-                logger.debug("Deleted emailed PDF %s", pdf_path)
-            except Exception:
-                logger.warning("Failed to delete PDF after email: %s", pdf_path)
+                body = _render_template(report.email.body, ctx, html=False)
+                body_html = (
+                    _render_template(report.email.body_html, ctx, html=True)
+                    if report.email.body_html
+                    else None
+                )
+                email_ctx = {**ctx, "text_body": body, "html_body": body_html}
+                subject = _render_template(report.email.subject, ctx, html=False)
+                logger.info("Sending email to %s subject=%s", report.email.to, subject)
+                await asyncio.to_thread(
+                    self.mailer.send,
+                    report.email.to,
+                    subject,
+                    body,
+                    pdf_path,
+                    context=email_ctx,
+                    html_body=body_html,
+                )
+            finally:
+                # Emailed (or failed-to-email) PDFs must not accumulate on disk
+                try:
+                    pdf_path.unlink(missing_ok=True)
+                    logger.debug("Deleted emailed PDF %s", pdf_path)
+                except Exception:
+                    logger.warning("Failed to delete PDF after email: %s", pdf_path)
         elif send_mail:
             logger.debug(
                 "Email not sent for %s: email_enabled=%s has_recipients=%s",

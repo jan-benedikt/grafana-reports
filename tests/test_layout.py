@@ -111,3 +111,28 @@ def test_paginate_js_uses_all_grid_items():
 def test_prepare_print_js_expands_document():
     assert "document.documentElement.style.height" in PREPARE_PRINT_JS
     assert "scrollbar-view" in PREPARE_PRINT_JS
+
+
+def test_clamp_viewport_height_respects_pixel_budget():
+    from reporting.layout import clamp_viewport_height
+
+    # 1920 wide at scale 2 with a 120 Mpx budget -> ~15,625 px max height
+    h = clamp_viewport_height(
+        30000, width=1920, scale=2.0, max_height=30000, pixel_budget=120_000_000
+    )
+    assert h == 120_000_000 // (1920 * 4)
+
+    # Within budget: untouched (aside from the hard cap)
+    assert clamp_viewport_height(
+        5000, width=1920, scale=2.0, max_height=30000, pixel_budget=120_000_000
+    ) == 5000
+
+    # Budget disabled: only the hard cap applies
+    assert clamp_viewport_height(
+        50000, width=1920, scale=2.0, max_height=30000, pixel_budget=0
+    ) == 30000
+
+    # Never below the minimum height
+    assert clamp_viewport_height(
+        10000, width=7680, scale=4.0, max_height=30000, pixel_budget=1_000_000, min_height=720
+    ) == 720

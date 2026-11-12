@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -11,16 +14,20 @@ def _bool_env(name: str, default: bool = False) -> bool:
 
 
 def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default))
     try:
-        return int(os.getenv(name, str(default)))
+        return int(raw)
     except ValueError:
+        logger.warning("Invalid integer %r for env %s; using default %s", raw, name, default)
         return default
 
 
 def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default))
     try:
-        return float(os.getenv(name, str(default)))
+        return float(raw)
     except ValueError:
+        logger.warning("Invalid float %r for env %s; using default %s", raw, name, default)
         return default
 
 
@@ -80,6 +87,12 @@ class Settings:
     pdf_max_viewport_height: int = field(default_factory=lambda: _int_env("PDF_MAX_VIEWPORT_HEIGHT", 30000))
 
     pdf_fast_mode: bool = field(default_factory=lambda: _bool_env("PDF_FAST_MODE", True))
+    # Replace per-cell gradients/shadows before print so Acrobat does not
+    # paint table cells one by one. Set PDF_SIMPLIFY_TABLES=0 to keep them.
+    pdf_simplify_tables: bool = field(default_factory=lambda: _bool_env("PDF_SIMPLIFY_TABLES", True))
+    # Device-pixel budget (width*scale x height*scale) for the expanded viewport.
+    # ~1 GB Chromium RSS was measured near 230 Mpx; default keeps a safe margin.
+    pdf_max_render_pixels: int = field(default_factory=lambda: _int_env("PDF_MAX_RENDER_PIXELS", 120_000_000))
     ready_timeout_ms: int = field(default_factory=lambda: _int_env("READY_TIMEOUT_MS", 180000))
     network_idle_timeout_ms: int = field(default_factory=lambda: _int_env("NETWORK_IDLE_TIMEOUT_MS", 20000))
     wait_before_ready_ms: int = field(default_factory=lambda: _int_env("WAIT_BEFORE_READY_MS", 0))
@@ -103,6 +116,11 @@ class Settings:
     force_kiosk_css: bool = field(default_factory=lambda: _bool_env("FORCE_KIOSK_CSS", True))
     run_all_concurrency: int = field(default_factory=lambda: _int_env("RUN_ALL_CONCURRENCY", 2))
     queue_max_pending: int = field(default_factory=lambda: _int_env("QUEUE_MAX_PENDING", 10))
+    # End-to-end budget for one report job (render + email); 0 disables the limit.
+    job_timeout_s: float = field(default_factory=lambda: _float_env("JOB_TIMEOUT_S", 600.0))
+    smtp_timeout_s: float = field(default_factory=lambda: _float_env("SMTP_TIMEOUT", 30.0))
+    # Orphaned PDFs/screenshots older than this are swept from PDF_OUTDIR; 0 disables.
+    pdf_retention_hours: float = field(default_factory=lambda: _float_env("PDF_RETENTION_HOURS", 6.0))
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
 
     config_path: Path = field(default_factory=lambda: Path(os.getenv("REPORTS_CONFIG_PATH", "config.yml")))

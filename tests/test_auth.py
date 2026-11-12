@@ -58,3 +58,11 @@ def test_resolve_timezone_grafana_aliases():
     assert resolve_timezone("America/New_York", "Europe/Prague").key == "America/New_York"
     # Unknown → fallback (don't 400 on Grafana quirks)
     assert resolve_timezone("not-a-real-zone", "Europe/Prague").key == "Europe/Prague"
+
+
+def test_non_ascii_key_rejected_with_401():
+    """Non-ASCII input must yield 401, not a TypeError/500 (regression)."""
+    cfg = Settings(api_keys=["secret"])
+    with pytest.raises(HTTPException) as exc:
+        verify_api_key(authorization=None, x_api_key="ключ-ü", cfg=cfg)
+    assert exc.value.status_code == 401

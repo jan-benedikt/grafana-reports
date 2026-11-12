@@ -135,3 +135,54 @@ reports:
     tz, reports = load_reports_config(path, "Europe/Berlin")
     assert tz == "Europe/Berlin"
     assert len(reports) == 1
+
+
+def test_email_defaults_are_strings_when_omitted(tmp_path):
+    """slots=True dataclass defaults must not leak member descriptors (regression)."""
+    path = _write(
+        tmp_path,
+        """
+timezone: UTC
+reports:
+  - name: Bare email block
+    dashboard_uid: uid1
+    email:
+      to: ["ops@example.com"]
+""",
+    )
+    _, reports = load_reports_config(path, "UTC")
+    email = reports[0].email
+    assert isinstance(email.subject, str) and "{{" in email.subject
+    assert isinstance(email.body, str) and "{{" in email.body
+
+
+def test_invalid_render_value_raises_configerror(tmp_path):
+    path = _write(
+        tmp_path,
+        """
+timezone: UTC
+reports:
+  - name: Bad render
+    dashboard_uid: uid1
+    render:
+      width: not-a-number
+""",
+    )
+    with pytest.raises(ConfigError, match="invalid render value"):
+        load_reports_config(path, "UTC")
+
+
+def test_render_out_of_range_raises_configerror(tmp_path):
+    path = _write(
+        tmp_path,
+        """
+timezone: UTC
+reports:
+  - name: Huge scale
+    dashboard_uid: uid1
+    render:
+      scale_factor: 100
+""",
+    )
+    with pytest.raises(ConfigError, match="scale_factor"):
+        load_reports_config(path, "UTC")

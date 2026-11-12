@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import time
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 _UID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
@@ -54,3 +57,39 @@ def resolve_timezone(name: str | None, fallback: str) -> ZoneInfo:
     except Exception:
         logger.warning("Unknown timezone %r, falling back to %r", raw, fallback)
         return ZoneInfo(fallback)
+
+
+def sweep_old_pdfs(outdir: Path, max_age_s: float) -> int:
+    """Delete generated artifacts (*.pdf, *.png) older than ``max_age_s``.
+
+    Orphaned files accumulate when a response is never delivered (client
+    disconnect) or a run fails after rendering; without a sweep they can
+    exhaust the pod's emptyDir and trigger eviction.
+    """
+    if max_age_s <= 0:
+        return 0
+    cutoff = time.time() - max_age_s
+    removed = 0
+    for pattern in ("*.pdf", "*.png"):
+        for path in outdir.glob(pattern):
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink(missing_ok=True)
+                    removed += 1
+            except OSError:
+                logger.debug("Could not sweep %s", path, exc_info=True)
+    if removed:
+        logger.info("Swept %d stale artifact(s) from %s", removed, outdir)
+    return removed
+
+
+async def pdf_sweeper_loop(outdir: Path, max_age_s: float, interval_s: float = 900.0) -> None:
+    """Periodically sweep stale PDFs until cancelled."""
+    if max_age_s <= 0:
+        return
+    while True:
+        try:
+            sweep_old_pdfs(outdir, max_age_s)
+        except Exception:
+            logger.warning("PDF sweep failed", exc_info=True)
+        await asyncio.sleep(interval_s)

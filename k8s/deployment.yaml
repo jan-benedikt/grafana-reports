@@ -42,36 +42,39 @@ spec:
               mountPath: /tmp/pdfs
             - name: tmp
               mountPath: /tmp
-            - name: dshm
-              mountPath: /dev/shm
           livenessProbe:
             httpGet:
               path: /healthz
               port: http
             initialDelaySeconds: 30
             periodSeconds: 30
+            # Chromium can saturate the CPU limit during large renders; the
+            # default 1s probe timeout would restart the pod mid-render.
+            timeoutSeconds: 5
+            failureThreshold: 5
           readinessProbe:
             httpGet:
               path: /readyz
               port: http
             initialDelaySeconds: 10
             periodSeconds: 15
+            timeoutSeconds: 5
           resources:
             requests:
               cpu: 250m
               memory: 1Gi
             limits:
               cpu: "2"
-              memory: 2Gi
+              # Large dashboards were measured at ~1 GiB Chromium RSS per render;
+              # two concurrent renders need headroom above 2Gi.
+              memory: 3Gi
+      terminationGracePeriodSeconds: 60
       volumes:
         - name: reports-config
           configMap:
             name: grafana-reports-config
         - name: pdf-tmp
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 1Gi
         - name: tmp
           emptyDir: {}
-        - name: dshm
-          emptyDir:
-            medium: Memory
-            sizeLimit: 1Gi
